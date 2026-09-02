@@ -46,9 +46,13 @@ yolo_visdrone/
 *.pth
 *.onnx
 runs/
+**/runs/
 results/
 dataset/
+aero_output/
+.pytest_cache/
 
 # OS specific
 .DS_Store
 Thumbs.db
+.gemini/

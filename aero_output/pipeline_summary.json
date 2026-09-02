@@ -1,0 +1,21 @@
+{
+  "project": "AERO MESH UAV 3D Reconstruction",
+  "stats": {
+    "high_confidence_observed_pct": 0.0,
+    "monocular_infill_pct": 96.7,
+    "hallucinated_inferred_pct": 3.3,
+    "mean_confidence": 0.411
+  },
+  "metadata": {
+    "num_frames_processed": 15,
+    "num_keyframes_selected": 10,
+    "total_points_3d": 45948,
+    "origin_lat_lon_alt": [
+      28.6139,
+      77.20915625,
+      25.0
+    ],
+    "tier1_file": "tier1_sparse_cloud.ply",
+    "tier2_file": "tier2_dense_confidence_mesh.ply"
+  }
+}

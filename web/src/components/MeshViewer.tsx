@@ -1,281 +1,743 @@
-import React, { useRef, useMemo, useState, useCallback } from 'react';
-import { Canvas, useFrame, useThree } from '@react-three/fiber';
-import { OrbitControls, Line, Html, Stars } from '@react-three/drei';
+import React, { useState, useEffect, useRef, useCallback, Suspense } from 'react';
+import { Play, Pause, SkipForward, SkipBack, Crosshair, Navigation } from 'lucide-react';
+import { Canvas, useFrame, useThree, useLoader } from '@react-three/fiber';
+import { OrbitControls, PerspectiveCamera } from '@react-three/drei';
 import * as THREE from 'three';
 
-// ─────────────────────────────────────────────────────────────
-// Types
-// ─────────────────────────────────────────────────────────────
 interface MeshViewerProps {
   viewMode: 'rgb' | 'heatmap' | 'source';
   tierMode: 'tier1' | 'tier2';
   clipHeight: number;
+  pointSize: number;
   showTrajectory: boolean;
-  onPointHover?: (info: HoverInfo | null) => void;
+  onPointHover?: (info: any) => void;
 }
 
-interface HoverInfo {
+// ── Types matching flight_plan.json ──────────────────────────────────────────
+interface TrajectoryPoint {
+  timestamp: number;
+  lat: number; lon: number; alt: number;
+  vx: number; // 0-100 percentage of image width
+  vy: number; // 0-100 percentage of image height
+}
+interface FrameEntry  { filename: string; frameOffset: number; }
+interface Sequence    { seqId: string; frameCount: number; frames: FrameEntry[]; trajectoryPoints: TrajectoryPoint[]; }
+interface FlightPlan  { generatedAt: string; totalImages: number; sequences: Sequence[]; originLatLon: [number, number]; }
+
+// ── pointcloud.json types ─────────────────────────────────────────────────────
+interface MeshPlane {
+  filename: string;
   x: number; y: number; z: number;
-  confidence: number;
-  type: string;
+  w: number; h: number; frame: number;
+}
+interface MeshBox {
+  x: number; y: number; z: number;
+  w: number; h: number; d: number;
+  r: number; g: number; b: number;
+  conf: number; cls: number; label: string; frame: number;
+}
+interface PointCloud {
+  generatedAt: string;
+  weightsUsed: string;
+  epochAtExport: number;
+  mAP50AtExport: number;
+  modelName: string;
+  classNames: string[];
+  nc: number;
+  classColors: Record<string, [number, number, number]>;
+  planes: MeshPlane[];
+  boxes: MeshBox[];
 }
 
-// ─────────────────────────────────────────────────────────────
-// Synthetic data generator — realistic urban UAV scene
-// ─────────────────────────────────────────────────────────────
-function generateSceneData(tierMode: 'tier1' | 'tier2', clipHeight: number) {
-  const numPoints = tierMode === 'tier1' ? 4000 : 38000;
-  const pts: number[] = [];
-  const rgbs: number[] = [];
-  const heatmaps: number[] = [];
-  const sources: number[] = [];
-  const confs: number[] = [];
-
-  // UAV trajectory — arc sweep over scene
-  const trajectory: [number, number, number][] = [];
-  for (let t = 0; t <= 1; t += 0.025) {
-    const angle = t * Math.PI * 0.7 - Math.PI * 0.35;
-    trajectory.push([
-      16 * Math.cos(angle),
-      16 * Math.sin(angle),
-      11 + Math.sin(t * Math.PI) * 1.5,
-    ]);
-  }
-
-  const rng = (a: number, b: number) => a + Math.random() * (b - a);
-  const noise = (s: number) => (Math.random() - 0.5) * s;
-
-  // ── Region definitions ──────────────────────────────────────
-  const regions = [
-    // Main building roof — high confidence MVS
-    { weight: 0.18, gen: () => ({
-      x: rng(-5, 5), y: rng(-4, 4), z: rng(4.0, 5.2),
-      r: 0.55 + noise(0.05), g: 0.52 + noise(0.05), b: 0.50 + noise(0.05),
-      hmr: 0.05, hmg: 0.75, hmb: 1.0, srr: 0.05, srg: 0.85, srb: 0.9,
-      conf: 0.93, type: 'MVS Roof',
-    })},
-    // Building B (smaller annex)
-    { weight: 0.08, gen: () => ({
-      x: rng(7, 12), y: rng(-3, 3), z: rng(2.5, 3.5),
-      r: 0.60 + noise(0.05), g: 0.55 + noise(0.05), b: 0.48 + noise(0.05),
-      hmr: 0.05, hmg: 0.68, hmb: 0.95, srr: 0.05, srg: 0.80, srb: 0.90,
-      conf: 0.89, type: 'MVS Roof B',
-    })},
-    // Building facades (walls) — lower confidence (single-pass limited angle)
-    { weight: 0.12, gen: () => ({
-      x: rng(-5.5, 5.5), y: rng(-4.5, 4.5), z: rng(0.0, 4.0),
-      r: 0.62 + noise(0.08), g: 0.55 + noise(0.08), b: 0.45 + noise(0.08),
-      hmr: 0.15, hmg: 0.80, hmb: 0.95, srr: 0.10, srg: 0.80, srb: 0.88,
-      conf: 0.78, type: 'MVS Facade',
-    })},
-    // Road surface — monocular infill
-    { weight: 0.22, gen: () => ({
-      x: rng(-18, 18), y: rng(-16, 16), z: rng(-0.4, 0.2),
-      r: 0.28 + noise(0.04), g: 0.28 + noise(0.04), b: 0.30 + noise(0.04),
-      hmr: 0.95, hmg: 0.80, hmb: 0.10, srr: 0.90, srg: 0.70, srb: 0.15,
-      conf: 0.62, type: 'Mono Infill Road',
-    })},
-    // Terrain / grass — monocular
-    { weight: 0.18, gen: () => ({
-      x: rng(-20, 20), y: rng(-18, 18), z: rng(-0.8, 0.5),
-      r: 0.22 + noise(0.06), g: 0.45 + noise(0.06), b: 0.18 + noise(0.06),
-      hmr: 0.90, hmg: 0.72, hmb: 0.08, srr: 0.88, srg: 0.65, srb: 0.12,
-      conf: 0.60, type: 'Mono Infill Terrain',
-    })},
-    // Vegetation cluster — monocular
-    { weight: 0.09, gen: () => ({
-      x: rng(-14, -8) + noise(2), y: rng(6, 12) + noise(2), z: rng(0.5, 3.5),
-      r: 0.18 + noise(0.05), g: 0.52 + noise(0.08), b: 0.12 + noise(0.04),
-      hmr: 0.88, hmg: 0.72, hmb: 0.08, srr: 0.85, srg: 0.65, srb: 0.12,
-      conf: 0.56, type: 'Mono Infill Vegetation',
-    })},
-    // Occluded wall base — 3DGS hallucinated
-    { weight: 0.08, gen: () => ({
-      x: rng(-5, 5), y: rng(-4, 4), z: rng(-2.5, -0.5),
-      r: 0.72 + noise(0.08), g: 0.42 + noise(0.06), b: 0.25 + noise(0.06),
-      hmr: 0.97, hmg: 0.15, hmb: 0.12, srr: 0.97, srg: 0.18, srb: 0.18,
-      conf: 0.25, type: '3DGS Hallucinated',
-    })},
-    // Infrastructure (fences, poles) — hallucinated
-    { weight: 0.05, gen: () => ({
-      x: rng(-12, 12), y: rng(-12, 12), z: rng(1.5, 5.0),
-      r: 0.65 + noise(0.08), g: 0.38 + noise(0.06), b: 0.22 + noise(0.06),
-      hmr: 0.97, hmg: 0.18, hmb: 0.15, srr: 0.95, srg: 0.20, srb: 0.20,
-      conf: 0.20, type: '3DGS Hallucinated',
-    })},
-  ];
-
-  // Build cumulative weights
-  const cumulative: number[] = [];
-  let total = 0;
-  for (const r of regions) { total += r.weight; cumulative.push(total); }
-
-  for (let i = 0; i < numPoints; i++) {
-    const rand = Math.random() * total;
-    const regionIdx = cumulative.findIndex(c => rand <= c);
-    const region = regions[Math.max(0, regionIdx)];
-    const d = region.gen();
-
-    if (d.z > clipHeight) continue;
-
-    pts.push(d.x, d.y, d.z);
-    rgbs.push(d.r, d.g, d.b);
-    heatmaps.push(d.hmr, d.hmg, d.hmb);
-    sources.push(d.srr, d.srg, d.srb);
-    confs.push(d.conf);
-  }
-
-  return {
-    points: new Float32Array(pts),
-    rgbColors: new Float32Array(rgbs),
-    heatmapColors: new Float32Array(heatmaps),
-    sourceColors: new Float32Array(sources),
-    confidences: new Float32Array(confs),
-    trajectory,
-  };
+// ── VisDrone annotation categories ───────────────────────────────────────────
+const CATEGORY_LABELS: Record<number, string> = {
+  1: 'Pedestrian', 2: 'People', 3: 'Bicycle', 4: 'Car',
+  5: 'Van', 6: 'Truck', 7: 'Tricycle', 8: 'Awning-Tricycle',
+  9: 'Bus', 10: 'Motor', 11: 'Others',
+};
+const CATEGORY_COLORS: Record<number, string> = {
+  1: '#38bdf8', 2: '#38bdf8', 3: '#f43f5e', 4: '#10b981',
+  5: '#f59e0b', 6: '#f59e0b', 7: '#a78bfa', 8: '#a78bfa',
+  9: '#f59e0b', 10: '#f43f5e', 11: '#64748b',
+};
+interface BBox {
+  x: number; y: number; w: number; h: number;
+  label: string; color: string;
 }
 
-// ─────────────────────────────────────────────────────────────
-// UAV drone mesh (simple geometric indicator)
-// ─────────────────────────────────────────────────────────────
-const UAVDrone: React.FC<{ trajectory: [number, number, number][] }> = ({ trajectory }) => {
-  const droneRef = useRef<THREE.Mesh>(null);
-  const progress = useRef(0);
-
-  useFrame((_, delta) => {
-    progress.current = (progress.current + delta * 0.04) % 1;
-    const t = progress.current;
-    const idx = Math.min(Math.floor(t * (trajectory.length - 1)), trajectory.length - 2);
-    const alpha = (t * (trajectory.length - 1)) - idx;
-    const p = trajectory[idx];
-    const pn = trajectory[idx + 1];
-    if (droneRef.current && p && pn) {
-      droneRef.current.position.set(
-        p[0] + (pn[0] - p[0]) * alpha,
-        p[1] + (pn[1] - p[1]) * alpha,
-        p[2] + (pn[2] - p[2]) * alpha,
-      );
-      droneRef.current.rotation.z = Math.sin(Date.now() * 0.003) * 0.05;
-    }
+function parseAnnotation(txt: string): BBox[] {
+  return txt.split('\n').filter(l => l.trim().length > 0).flatMap(line => {
+    const parts = line.split(',').map(Number);
+    if (parts.length < 6) return [];
+    const [left, top, width, height, , category] = parts;
+    if (category === 0 || !CATEGORY_LABELS[category]) return [];
+    return [{ x: left, y: top, w: width, h: height,
+              label: CATEGORY_LABELS[category],
+              color: CATEGORY_COLORS[category] ?? '#64748b' }];
   });
+}
 
+// ── View filters ──────────────────────────────────────────────────────────────
+const VIEW_FILTER: Record<string, string> = {
+  heatmap: 'saturate(0.35) brightness(0.65)',
+  rgb:     'saturate(1.15) brightness(1.05) contrast(1.02)',
+  source:  'grayscale(1) brightness(0.75) contrast(1.15)',
+};
+const VIEW_TINT: Record<string, string> = {
+  heatmap: 'rgba(14,165,233,0.15)',
+  rgb:     'transparent',
+  source:  'rgba(99,102,241,0.12)',
+};
+
+// ── Rendered image rect accounting for object-contain letterboxing ────────────
+function getRenderedRect(
+  containerW: number, containerH: number, natW: number, natH: number
+): { left: number; top: number; w: number; h: number } {
+  if (natW === 0 || natH === 0) return { left: 0, top: 0, w: containerW, h: containerH };
+  const scale = Math.min(containerW / natW, containerH / natH);
+  const w = natW * scale;
+  const h = natH * scale;
+  return { left: (containerW - w) / 2, top: (containerH - h) / 2, w, h };
+}
+
+// ── Scan line ─────────────────────────────────────────────────────────────────
+const ScanLine: React.FC = () => {
+  const [pos, setPos] = useState(0);
+  useEffect(() => {
+    const iv = setInterval(() => setPos(p => (p + 0.3) % 100), 16);
+    return () => clearInterval(iv);
+  }, []);
   return (
-    <mesh ref={droneRef}>
-      <boxGeometry args={[0.6, 0.6, 0.15]} />
-      <meshStandardMaterial color="#38bdf8" emissive="#0ea5e9" emissiveIntensity={0.4} />
+    <div style={{
+      position: 'absolute', left: 0, right: 0, top: `${pos}%`, height: 1,
+      background: 'linear-gradient(90deg,transparent,rgba(56,189,248,0.2),rgba(56,189,248,0.45),rgba(56,189,248,0.2),transparent)',
+      pointerEvents: 'none',
+    }} />
+  );
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Three.js Point Cloud (Tier 2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Converts confidence (0-1) to a heatmap RGB color (blue→cyan→green→yellow→red) */
+function confToColor(conf: number): [number, number, number] {
+  const t = Math.max(0, Math.min(1, conf));
+  if (t < 0.33) {
+    const s = t / 0.33;
+    return [244, Math.round(63 + s * (158 - 63)), Math.round(94 + s * (11 - 94))]; // rose→amber
+  }
+  if (t < 0.66) {
+    const s = (t - 0.33) / 0.33;
+    return [Math.round(245 + s * (56 - 245)), Math.round(158 + s * (189 - 158)), Math.round(11 + s * (248 - 11))]; // amber→cyan
+  }
+  const s = (t - 0.66) / 0.34;
+  return [Math.round(56 - s * 40), Math.round(189 - s * 4), Math.round(248 - s * 119)]; // cyan→emerald
+}
+
+/** Source tag color: 1.0=MVS(cyan), ~0.6=mono(amber), ~0.2=3DGS(rose) */
+function sourceToColor(tag: number): [number, number, number] {
+  if (tag >= 0.85) return [14, 165, 233];   // MVS – cyan
+  if (tag >= 0.5)  return [245, 158, 11];   // mono – amber
+  return [244, 63, 94];                      // 3DGS – rose
+}
+
+interface PointCloudMeshProps {
+  cloud: PointCloud;
+  viewMode: 'rgb' | 'heatmap' | 'source';
+  clipHeight: number;
+  pointSize: number; // Ignored for mesh view, but kept for interface compatibility
+}
+
+const TexturedPlane: React.FC<{ plane: MeshPlane }> = ({ plane }) => {
+  const texture = useLoader(THREE.TextureLoader, `/drone/${plane.filename}`);
+  return (
+    <mesh position={[plane.x, plane.z, plane.y]} rotation={[-Math.PI / 2, 0, 0]}>
+      <planeGeometry args={[plane.w, plane.h]} />
+      <meshBasicMaterial map={texture} side={THREE.DoubleSide} />
     </mesh>
   );
 };
 
-// ─────────────────────────────────────────────────────────────
-// Main point cloud scene
-// ─────────────────────────────────────────────────────────────
-const PointCloudScene: React.FC<MeshViewerProps> = ({
-  viewMode, tierMode, clipHeight, showTrajectory,
-}) => {
-  const pointsRef = useRef<THREE.Points>(null);
+const ReconstructedMesh: React.FC<PointCloudMeshProps> = ({ cloud, viewMode, clipHeight }) => {
+  const groupRef = useRef<THREE.Group>(null);
 
-  const { points, rgbColors, heatmapColors, sourceColors, trajectory } = useMemo(
-    () => generateSceneData(tierMode, clipHeight),
-    [tierMode, clipHeight]
-  );
-
-  const activeColors = useMemo(() => {
-    if (viewMode === 'heatmap') return heatmapColors;
-    if (viewMode === 'source') return sourceColors;
-    return rgbColors;
-  }, [viewMode, rgbColors, heatmapColors, sourceColors]);
-
-  const pointSize = tierMode === 'tier1' ? 0.22 : 0.07;
+  // Slow auto-rotate when not interacting
+  useFrame((_, delta) => {
+    if (groupRef.current) {
+      groupRef.current.rotation.y += delta * 0.03;
+    }
+  });
 
   return (
-    <>
-      {/* Lighting */}
-      <ambientLight intensity={0.5} />
-      <directionalLight position={[15, 25, 20]} intensity={1.0} castShadow />
-      <pointLight position={[-10, -10, 15]} intensity={0.3} color="#38bdf8" />
-
-      {/* Background stars */}
-      <Stars radius={200} depth={60} count={1200} factor={2} saturation={0} fade speed={0.5} />
-
-      {/* Main point cloud */}
-      <points ref={pointsRef}>
-        <bufferGeometry>
-          <bufferAttribute attach="attributes-position" args={[points, 3]} />
-          <bufferAttribute attach="attributes-color" args={[activeColors, 3]} />
-        </bufferGeometry>
-        <pointsMaterial
-          size={pointSize}
-          vertexColors
-          sizeAttenuation
-          transparent
-          opacity={0.88}
-          depthWrite={false}
-        />
-      </points>
-
-      {/* Ground reference grid */}
-      <gridHelper
-        args={[40, 40, '#1e293b', '#0f172a']}
-        position={[0, 0, -3]}
-        rotation={[Math.PI / 2, 0, 0]}
-      />
-
-      {/* Building outline wireframes (reference geometry) */}
-      <lineSegments position={[0, 0, 0]}>
-        <edgesGeometry args={[new THREE.BoxGeometry(10, 8, 5.2)]} />
-        <lineBasicMaterial color="#334155" transparent opacity={0.35} />
-      </lineSegments>
-      <lineSegments position={[9.5, 0, 0]}>
-        <edgesGeometry args={[new THREE.BoxGeometry(5, 6, 3.5)]} />
-        <lineBasicMaterial color="#334155" transparent opacity={0.30} />
-      </lineSegments>
-
-      {/* UAV trajectory path */}
-      {showTrajectory && trajectory.length > 1 && (
-        <>
-          <Line
-            points={trajectory}
-            color="#38bdf8"
-            lineWidth={2}
-            dashed={false}
-            transparent
-            opacity={0.7}
-          />
-          <UAVDrone trajectory={trajectory} />
-        </>
-      )}
-
-      {/* Scan effect ring at flight altitude */}
-      {showTrajectory && (
-        <mesh position={[0, 0, 10.5]} rotation={[Math.PI / 2, 0, 0]}>
-          <ringGeometry args={[13.5, 14.5, 64]} />
-          <meshBasicMaterial color="#38bdf8" transparent opacity={0.08} side={THREE.DoubleSide} />
-        </mesh>
-      )}
-
-      <OrbitControls
-        makeDefault
-        enableDamping
-        dampingFactor={0.06}
-        minDistance={4}
-        maxDistance={80}
-      />
-    </>
+    <group ref={groupRef}>
+      {cloud.planes?.map((plane, i) => (
+        <TexturedPlane key={i} plane={plane} />
+      ))}
+      
+      {cloud.boxes?.filter(b => b.z <= clipHeight).map((box, i) => {
+        let r, g, b;
+        if (viewMode === 'rgb') {
+          r = box.r / 255; g = box.g / 255; b = box.b / 255;
+        } else if (viewMode === 'heatmap') {
+          [r, g, b] = confToColor(box.conf).map(v => v / 255) as [number, number, number];
+        } else {
+          // source: use class color as proxy for source origin
+          const srcTag = box.conf > 0.5 ? 1.0 : 0.4;
+          [r, g, b] = sourceToColor(srcTag).map(v => v / 255) as [number, number, number];
+        }
+        const color = new THREE.Color(r, g, b);
+        
+        return (
+          <mesh key={`box-${i}`} position={[box.x, box.z, box.y]}>
+            <boxGeometry args={[box.w, box.h, box.d]} />
+            <meshBasicMaterial color={color} transparent opacity={0.5} depthWrite={false} />
+            <lineSegments>
+              <edgesGeometry args={[new THREE.BoxGeometry(box.w, box.h, box.d)]} />
+              <lineBasicMaterial color={color} transparent opacity={0.9} />
+            </lineSegments>
+          </mesh>
+        );
+      })}
+    </group>
   );
 };
 
-// ─────────────────────────────────────────────────────────────
-// Public export
-// ─────────────────────────────────────────────────────────────
-export const MeshViewer: React.FC<MeshViewerProps> = (props) => {
+interface PointCloudViewerProps {
+  cloud: PointCloud;
+  viewMode: 'rgb' | 'heatmap' | 'source';
+  clipHeight: number;
+  pointSize: number;
+}
+
+const PointCloudViewer: React.FC<PointCloudViewerProps> = ({ cloud, viewMode, clipHeight, pointSize }) => (
+  <Canvas
+    style={{ width: '100%', height: '100%', background: '#060b14' }}
+    gl={{ antialias: true, alpha: true }}
+  >
+    <PerspectiveCamera makeDefault position={[0, 8, 28]} fov={55} />
+    <ambientLight intensity={0.6} />
+    <pointLight position={[10, 20, 10]} intensity={0.8} />
+    <Suspense fallback={null}>
+      <ReconstructedMesh cloud={cloud} viewMode={viewMode} clipHeight={clipHeight} pointSize={pointSize} />
+    </Suspense>
+    <OrbitControls
+      enableDamping
+      dampingFactor={0.08}
+      minDistance={3}
+      maxDistance={80}
+      makeDefault
+    />
+    {/* Grid floor */}
+    <gridHelper args={[40, 20, '#0f2040', '#0d1a2e']} />
+  </Canvas>
+);
+
+/** Overlay shown when pointcloud.json is missing */
+const PointCloudPlaceholder: React.FC<{ epoch: number }> = ({ epoch }) => (
+  <div style={{
+    width: '100%', height: '100%',
+    display: 'flex', flexDirection: 'column',
+    alignItems: 'center', justifyContent: 'center',
+    background: '#060b14', gap: 16,
+  }}>
+    <div style={{
+      width: 60, height: 60, borderRadius: 14,
+      background: 'rgba(56,189,248,0.08)',
+      border: '1px solid rgba(56,189,248,0.2)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+    }}>
+      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" strokeWidth="1.5">
+        <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+      </svg>
+    </div>
+    <div style={{ textAlign: 'center' }}>
+      <div style={{ fontSize: 13, fontWeight: 700, color: '#f1f5f9', marginBottom: 6 }}>
+        3D Point Cloud — Epoch {epoch}
+      </div>
+      <div style={{ fontSize: 11, color: '#64748b', maxWidth: 280, lineHeight: 1.6 }}>
+        Run the reconstruction script to build the 3D cloud from current training weights:
+      </div>
+      <div style={{
+        marginTop: 10, padding: '8px 14px',
+        background: 'rgba(15,23,42,0.8)', border: '1px solid rgba(56,189,248,0.2)',
+        borderRadius: 7, fontFamily: "'JetBrains Mono', monospace", fontSize: 10, color: '#38bdf8',
+      }}>
+        python scripts/reconstruct_3d.py
+      </div>
+    </div>
+  </div>
+);
+
+// ── Tier 2: 3D Reconstruction View ───────────────────────────────────────────
+
+interface Tier2ViewProps {
+  viewMode: 'rgb' | 'heatmap' | 'source';
+  clipHeight: number;
+  pointSize: number;
+}
+
+const Tier2View: React.FC<Tier2ViewProps> = ({ viewMode, clipHeight, pointSize }) => {
+  const [cloud, setCloud] = useState<PointCloud | null>(null);
+  const [epoch, setEpoch] = useState(0);
+
+  useEffect(() => {
+    // Load epoch from training_status.json
+    fetch('/training_status.json')
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (d) setEpoch(d.epoch ?? 0); })
+      .catch(() => {});
+
+    // Load point cloud
+    fetch('/pointcloud.json')
+      .then(r => r.ok ? r.json() : null)
+      .then((d: PointCloud | null) => { if (d) setCloud(d); })
+      .catch(() => {});
+  }, []);
+
+  if (!cloud) return <PointCloudPlaceholder epoch={epoch} />;
+
   return (
-    <Canvas
-      camera={{ position: [22, -18, 14], fov: 42, near: 0.1, far: 500 }}
-      gl={{ antialias: true, alpha: false }}
-      style={{ width: '100%', height: '100%' }}
+    <div style={{ width: '100%', height: '100%', position: 'relative' }}>
+      <PointCloudViewer cloud={cloud} viewMode={viewMode} clipHeight={clipHeight} pointSize={pointSize} />
+
+      {/* Info overlay */}
+      <div style={{
+        position: 'absolute', top: 10, left: '50%', transform: 'translateX(-50%)',
+        display: 'flex', gap: 8, pointerEvents: 'none', flexWrap: 'wrap', justifyContent: 'center',
+      }}>
+        {[
+          { label: 'EPOCH', value: String(cloud.epochAtExport) },
+          { label: 'mAP50', value: `${(cloud.mAP50AtExport * 100).toFixed(1)}%` },
+          { label: 'PLANES', value: cloud.planes?.length.toLocaleString() ?? '0' },
+          { label: 'BOXES', value: cloud.boxes?.length.toLocaleString() ?? '0' },
+          { label: 'MODEL', value: cloud.modelName.toUpperCase() },
+          { label: 'CLASSES', value: String(cloud.nc) },
+        ].map(({ label, value }) => (
+          <div key={label} style={{
+            background: 'rgba(6,11,20,0.82)', backdropFilter: 'blur(8px)',
+            border: '1px solid rgba(56,189,248,0.15)', borderRadius: 5,
+            padding: '3px 9px',
+            fontFamily: "'JetBrains Mono', monospace", fontSize: 10,
+          }}>
+            <span style={{ color: '#334155' }}>{label} </span>
+            <span style={{ color: '#38bdf8', fontWeight: 700 }}>{value}</span>
+          </div>
+        ))}
+      </div>
+
+      {/* Controls hint */}
+      <div style={{
+        position: 'absolute', bottom: 12, left: '50%', transform: 'translateX(-50%)',
+        fontFamily: "'JetBrains Mono', monospace", fontSize: 9, color: '#334155',
+        pointerEvents: 'none',
+      }}>
+        drag to rotate · scroll to zoom · right-drag to pan
+      </div>
+
+      {/* Scan line */}
+      <ScanLine />
+    </div>
+  );
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tier 1: 2D Drone Image Viewer (original MeshViewer logic, bbox FIXED)
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface Tier1ViewProps {
+  viewMode: 'rgb' | 'heatmap' | 'source';
+  showTrajectory: boolean;
+}
+
+const Tier1View: React.FC<Tier1ViewProps> = ({ viewMode, showTrajectory }) => {
+  const [plan, setPlan]               = useState<FlightPlan | null>(null);
+  const [seqIdx, setSeqIdx]           = useState(0);
+  const [frameIdx, setFrameIdx]       = useState(0);
+  const [imgLoaded, setImgLoaded]     = useState(false);
+  const [imgNat, setImgNat]           = useState({ w: 0, h: 0 });
+  const [boxes, setBoxes]             = useState<BBox[]>([]);
+  const [playing, setPlaying]         = useState(true);
+  const [containerSize, setContainerSize] = useState({ w: 0, h: 0 });
+  const containerRef  = useRef<HTMLDivElement>(null);
+  const intervalRef   = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Measure container
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(entries => {
+      const { width, height } = entries[0].contentRect;
+      setContainerSize({ w: width, h: height });
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // Load flight plan
+  useEffect(() => {
+    fetch('/flight_plan.json')
+      .then(r => r.json())
+      .then((data: FlightPlan) => setPlan(data))
+      .catch(e => console.error('Failed to load flight plan:', e));
+  }, []);
+
+  const currentSeq   = plan?.sequences[seqIdx] ?? null;
+  const totalFrames  = currentSeq?.frames.length ?? 0;
+  const currentFrame = currentSeq?.frames[frameIdx] ?? null;
+
+  // Load annotations
+  useEffect(() => {
+    if (!currentFrame) return;
+    setBoxes([]);
+    fetch(`/api/annotation/${currentFrame.filename.replace('.jpg', '.txt')}`)
+      .then(r => r.ok ? r.text() : '')
+      .then(txt => txt ? setBoxes(parseAnnotation(txt)) : setBoxes([]))
+      .catch(() => setBoxes([]));
+  }, [currentFrame?.filename]);
+
+  // Playback
+  const advance = useCallback(() => {
+    setImgLoaded(false);
+    setFrameIdx(i => {
+      if (i + 1 >= (currentSeq?.frames.length ?? 1)) {
+        if (plan) setSeqIdx(s => (s + 1) % plan.sequences.length);
+        return 0;
+      }
+      return i + 1;
+    });
+  }, [currentSeq, plan]);
+
+  const goBack = useCallback(() => {
+    setImgLoaded(false);
+    setFrameIdx(i => Math.max(0, i - 1));
+  }, []);
+
+  useEffect(() => {
+    if (playing) {
+      intervalRef.current = setInterval(advance, 5000);
+    } else {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+    }
+    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
+  }, [playing, advance]);
+
+  // Trajectory
+  const trajectoryPts     = currentSeq?.trajectoryPoints ?? [];
+  const activeWaypointIdx = trajectoryPts.length > 0
+    ? Math.floor((frameIdx / Math.max(totalFrames - 1, 1)) * (trajectoryPts.length - 1))
+    : 0;
+  const activeWpt = trajectoryPts[activeWaypointIdx];
+
+  // Viewport area (exclude 70px controls bar at bottom)
+  const viewH    = Math.max(1, containerSize.h - 70);
+  const viewW    = Math.max(1, containerSize.w);
+  const rendered = getRenderedRect(viewW, viewH, imgNat.w || viewW, imgNat.h || viewH);
+
+  // RIGHT / BOTTOM bounds of the rendered image area (absolute in container)
+  const renderedRight  = rendered.left + rendered.w;
+  const renderedBottom = rendered.top  + rendered.h;
+
+  const imgUrl = currentFrame ? `/drone/${currentFrame.filename}` : null;
+
+  return (
+    <div
+      ref={containerRef}
+      style={{ width: '100%', height: '100%', position: 'relative', background: '#060b14', overflow: 'hidden' }}
     >
-      <PointCloudScene {...props} />
-    </Canvas>
+      {/* Image */}
+      {imgUrl && (
+        <img
+          key={imgUrl}
+          src={imgUrl}
+          alt={`Seq ${currentSeq?.seqId} frame ${frameIdx + 1}`}
+          onLoad={(e) => {
+            setImgLoaded(true);
+            setImgNat({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight });
+          }}
+          onError={() => setImgLoaded(true)}
+          style={{
+            position: 'absolute', top: 0, left: 0,
+            width: '100%',
+            height: `calc(100% - 70px)`,
+            objectFit: 'contain',
+            objectPosition: 'center',
+            filter: VIEW_FILTER[viewMode] ?? 'none',
+            opacity: imgLoaded ? 1 : 0,
+            transition: 'opacity 0.3s ease, filter 0.4s ease',
+          }}
+        />
+      )}
+
+      {/* Loading shimmer */}
+      {!imgLoaded && (
+        <div style={{
+          position: 'absolute', top: 0, left: 0, right: 0, bottom: '70px',
+          background: 'linear-gradient(135deg,#0c1829,#0f2040,#0c1829)',
+        }} />
+      )}
+
+      {/* View mode tint */}
+      <div style={{
+        position: 'absolute', top: 0, left: 0, right: 0, bottom: '70px',
+        background: VIEW_TINT[viewMode],
+        pointerEvents: 'none', transition: 'background 0.4s ease',
+      }} />
+
+      {/* ── BOUNDING BOXES — clamped to rendered image rect ────────────── */}
+      {imgLoaded && imgNat.w > 0 && boxes.slice(0, 14).map((box, i) => {
+        // Convert annotation pixel coords → container-absolute pixels
+        const rawLeft = rendered.left + (box.x / imgNat.w) * rendered.w;
+        const rawTop  = rendered.top  + (box.y / imgNat.h) * rendered.h;
+        const rawW    = (box.w / imgNat.w) * rendered.w;
+        const rawH    = (box.h / imgNat.h) * rendered.h;
+
+        // Clamp left & top to stay inside rendered rect
+        const left = Math.max(rendered.left, rawLeft);
+        const top  = Math.max(rendered.top,  rawTop);
+
+        // Clamp right edge: box must not exceed rendered image right/bottom
+        const right  = Math.min(renderedRight,  rawLeft + Math.max(rawW, 6));
+        const bottom = Math.min(renderedBottom, rawTop  + Math.max(rawH, 6));
+
+        const w = right  - left;
+        const h = bottom - top;
+
+        // Skip degenerate boxes (completely outside image area)
+        if (w <= 0 || h <= 0) return null;
+
+        return (
+          <div key={i} style={{
+            position: 'absolute', left, top, width: w, height: h,
+            border: `1.5px solid ${box.color}`,
+            boxShadow: `0 0 6px ${box.color}40`,
+            pointerEvents: 'none',
+          }}>
+            <div style={{
+              position: 'absolute', top: '-15px', left: 0,
+              background: `${box.color}dd`, color: '#fff',
+              fontSize: 8, fontWeight: 700, padding: '1px 4px', borderRadius: 2,
+              whiteSpace: 'nowrap', fontFamily: "'JetBrains Mono', monospace",
+            }}>{box.label}</div>
+            {/* Corner ticks */}
+            {[
+              { top: -1, left: -1,   borderTop: `2px solid ${box.color}`, borderLeft:   `2px solid ${box.color}` },
+              { top: -1, right: -1,  borderTop: `2px solid ${box.color}`, borderRight:  `2px solid ${box.color}` },
+              { bottom: -1, left: -1,  borderBottom: `2px solid ${box.color}`, borderLeft:  `2px solid ${box.color}` },
+              { bottom: -1, right: -1, borderBottom: `2px solid ${box.color}`, borderRight: `2px solid ${box.color}` },
+            ].map((s, j) => (
+              <div key={j} style={{ position: 'absolute', width: 6, height: 6, ...s }} />
+            ))}
+          </div>
+        );
+      })}
+
+      {/* ── GPS Trajectory — inside rendered image rect only ─────────── */}
+      {showTrajectory && imgLoaded && trajectoryPts.length > 0 && (
+        <svg
+          style={{
+            position: 'absolute',
+            left: rendered.left, top: rendered.top,
+            width: rendered.w, height: rendered.h,
+            pointerEvents: 'none', overflow: 'hidden',
+          }}
+          viewBox={`0 0 ${rendered.w} ${rendered.h}`}
+        >
+          <defs>
+            <filter id="glow">
+              <feGaussianBlur stdDeviation="2.5" result="coloredBlur"/>
+              <feMerge><feMergeNode in="coloredBlur"/><feMergeNode in="SourceGraphic"/></feMerge>
+            </filter>
+          </defs>
+
+          {/* Path polyline */}
+          <polyline
+            points={trajectoryPts.map(p =>
+              `${(p.vx / 100) * rendered.w},${(p.vy / 100) * rendered.h}`
+            ).join(' ')}
+            fill="none"
+            stroke="rgba(56,189,248,0.35)"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+
+          {/* Waypoint dots */}
+          {trajectoryPts.map((p, i) => (
+            <circle
+              key={i}
+              cx={(p.vx / 100) * rendered.w}
+              cy={(p.vy / 100) * rendered.h}
+              r={i === activeWaypointIdx ? 5 : 2.5}
+              fill={i === activeWaypointIdx ? '#38bdf8' : 'rgba(56,189,248,0.5)'}
+              filter={i === activeWaypointIdx ? 'url(#glow)' : undefined}
+            />
+          ))}
+
+          {/* Active UAV ring */}
+          {activeWpt && (
+            <circle
+              cx={(activeWpt.vx / 100) * rendered.w}
+              cy={(activeWpt.vy / 100) * rendered.h}
+              r={13} fill="none" stroke="#38bdf8" strokeWidth="1.5" opacity="0.4"
+            />
+          )}
+        </svg>
+      )}
+
+      {/* Scan line */}
+      <ScanLine />
+
+      {/* Corner brackets */}
+      {[
+        { top: 12, left: 12,   borderTop: '2px solid rgba(56,189,248,0.45)', borderLeft:   '2px solid rgba(56,189,248,0.45)', width: 20, height: 20 },
+        { top: 12, right: 12,  borderTop: '2px solid rgba(56,189,248,0.45)', borderRight:  '2px solid rgba(56,189,248,0.45)', width: 20, height: 20 },
+        { bottom: 82, left: 12,  borderBottom: '2px solid rgba(56,189,248,0.45)', borderLeft:  '2px solid rgba(56,189,248,0.45)', width: 20, height: 20 },
+        { bottom: 82, right: 12, borderBottom: '2px solid rgba(56,189,248,0.45)', borderRight: '2px solid rgba(56,189,248,0.45)', width: 20, height: 20 },
+      ].map((s, i) => <div key={i} style={{ position: 'absolute', pointerEvents: 'none', ...s }} />)}
+
+      {/* Crosshair */}
+      <div style={{ position: 'absolute', top: `calc(50% - 35px)`, left: '50%', transform: 'translate(-50%,-50%)', pointerEvents: 'none', opacity: 0.25 }}>
+        <Crosshair size={24} color="#38bdf8" />
+      </div>
+
+      {/* HUD top bar */}
+      <div style={{
+        position: 'absolute', top: 10, left: '50%', transform: 'translateX(-50%)',
+        display: 'flex', gap: 8, pointerEvents: 'none', flexWrap: 'wrap', justifyContent: 'center',
+      }}>
+        {[
+          { label: 'SEQ',   value: currentSeq?.seqId ?? '–' },
+          { label: 'FRAME', value: totalFrames > 0 ? `${frameIdx + 1}/${totalFrames}` : '–' },
+          { label: 'ALT',   value: activeWpt ? `${activeWpt.alt.toFixed(1)}m` : '–' },
+          { label: 'LAT',   value: activeWpt ? activeWpt.lat.toFixed(5) : '–' },
+          { label: 'LON',   value: activeWpt ? activeWpt.lon.toFixed(5) : '–' },
+        ].map(({ label, value }) => (
+          <div key={label} style={{
+            background: 'rgba(6,11,20,0.82)', backdropFilter: 'blur(8px)',
+            border: '1px solid rgba(56,189,248,0.15)', borderRadius: 5,
+            padding: '3px 9px', fontFamily: "'JetBrains Mono', monospace", fontSize: 10,
+          }}>
+            <span style={{ color: '#334155' }}>{label} </span>
+            <span style={{ color: '#38bdf8', fontWeight: 700 }}>{value}</span>
+          </div>
+        ))}
+      </div>
+
+      {/* Object count */}
+      {boxes.length > 0 && (
+        <div style={{
+          position: 'absolute', top: 48, right: 12, pointerEvents: 'none',
+          background: 'rgba(6,11,20,0.82)', border: '1px solid rgba(56,189,248,0.18)',
+          borderRadius: 6, padding: '4px 10px',
+          fontFamily: "'JetBrains Mono', monospace", fontSize: 10,
+        }}>
+          <span style={{ color: '#475569' }}>OBJECTS </span>
+          <span style={{ color: '#10b981', fontWeight: 700 }}>{boxes.length}</span>
+        </div>
+      )}
+
+      {/* Waypoint info */}
+      {activeWpt && showTrajectory && (
+        <div style={{
+          position: 'absolute', top: 48, left: 12, pointerEvents: 'none',
+          background: 'rgba(6,11,20,0.82)', border: '1px solid rgba(56,189,248,0.18)',
+          borderRadius: 6, padding: '4px 10px',
+          display: 'flex', alignItems: 'center', gap: 6,
+          fontFamily: "'JetBrains Mono', monospace", fontSize: 10,
+        }}>
+          <Navigation size={10} color="#38bdf8" />
+          <span style={{ color: '#475569' }}>WPT {activeWaypointIdx + 1}/{trajectoryPts.length}</span>
+          <span style={{ color: '#38bdf8', fontWeight: 700 }}>t={activeWpt.timestamp.toFixed(1)}s</span>
+        </div>
+      )}
+
+      {/* Bottom controls bar */}
+      <div style={{
+        position: 'absolute', bottom: 0, left: 0, right: 0, height: 70,
+        background: 'linear-gradient(to top, rgba(6,11,20,0.98) 0%, rgba(6,11,20,0.85) 100%)',
+        padding: '8px 14px 10px',
+        display: 'flex', flexDirection: 'column', gap: 6,
+      }}>
+        {/* Sequence selector */}
+        {plan && (
+          <div style={{ display: 'flex', gap: 5 }}>
+            {plan.sequences.map((seq, i) => (
+              <button key={seq.seqId}
+                onClick={() => { setSeqIdx(i); setFrameIdx(0); setImgLoaded(false); }}
+                style={{
+                  flex: 1, padding: '3px 0', borderRadius: 4, border: 'none', cursor: 'pointer',
+                  fontSize: 8, fontWeight: 700, fontFamily: "'JetBrains Mono', monospace",
+                  background: i === seqIdx ? 'rgba(56,189,248,0.2)' : 'rgba(30,41,59,0.6)',
+                  color: i === seqIdx ? '#38bdf8' : '#475569',
+                  outline: i === seqIdx ? '1px solid rgba(56,189,248,0.4)' : 'none',
+                  transition: 'all 0.2s',
+                }}>
+                {seq.seqId}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Timeline + controls */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <button onClick={goBack}  style={btnStyle(false)}><SkipBack  size={12} /></button>
+          <button onClick={() => setPlaying(p => !p)} style={btnStyle(playing)}>
+            {playing ? <Pause size={12} /> : <Play size={12} />}
+            <span style={{ fontSize: 10, fontWeight: 700 }}>{playing ? 'LIVE' : 'PAUSED'}</span>
+          </button>
+          <button onClick={advance} style={btnStyle(false)}><SkipForward size={12} /></button>
+
+          {/* Scrubber */}
+          <div
+            style={{ flex: 1, height: 3, background: 'rgba(255,255,255,0.08)', borderRadius: 2, cursor: 'pointer', position: 'relative' }}
+            onClick={e => {
+              if (!currentSeq) return;
+              const r = e.currentTarget.getBoundingClientRect();
+              const ratio = (e.clientX - r.left) / r.width;
+              setFrameIdx(Math.min(Math.floor(ratio * currentSeq.frames.length), currentSeq.frames.length - 1));
+              setImgLoaded(false);
+            }}
+          >
+            <div style={{
+              position: 'absolute', left: 0, top: 0, bottom: 0,
+              width: totalFrames > 0 ? `${((frameIdx + 1) / totalFrames) * 100}%` : '0%',
+              background: 'linear-gradient(90deg,#0ea5e9,#6366f1)',
+              borderRadius: 2, boxShadow: '0 0 5px rgba(56,189,248,0.4)',
+              transition: 'width 0.4s ease',
+            }} />
+          </div>
+
+          <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 9, color: '#334155', whiteSpace: 'nowrap' }}>
+            {plan ? `${plan.totalImages} frames · ${trajectoryPts.length} wpts` : 'Loading…'}
+          </span>
+        </div>
+      </div>
+    </div>
   );
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main component — delegates to Tier1View or Tier2View
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const MeshViewer: React.FC<MeshViewerProps> = ({
+  viewMode, tierMode, clipHeight, pointSize, showTrajectory,
+}) => {
+  if (tierMode === 'tier2') {
+    return <Tier2View viewMode={viewMode} clipHeight={clipHeight} pointSize={pointSize} />;
+  }
+  return <Tier1View viewMode={viewMode} showTrajectory={showTrajectory} />;
+};
+
+function btnStyle(active: boolean): React.CSSProperties {
+  return {
+    background: active ? 'rgba(14,165,233,0.18)' : 'rgba(30,41,59,0.65)',
+    border: `1px solid ${active ? 'rgba(56,189,248,0.4)' : 'rgba(255,255,255,0.07)'}`,
+    borderRadius: 6, padding: '5px 12px', cursor: 'pointer',
+    color: active ? '#38bdf8' : '#94a3b8',
+    display: 'flex', alignItems: 'center', gap: 4,
+    boxShadow: active ? '0 0 8px rgba(56,189,248,0.2)' : 'none',
+    transition: 'all 0.2s', flexShrink: 0,
+  };
+}

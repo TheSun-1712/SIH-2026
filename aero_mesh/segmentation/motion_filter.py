@@ -32,7 +32,8 @@ def _init_raft():
         from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
         from torchvision.models.optical_flow import raft_large
 
-        _RAFT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+        import os
+        _RAFT_DEVICE = "cpu" if os.environ.get("AERO_CPU_ONLY") == "1" else ("cuda" if torch.cuda.is_available() else "cpu")
         weights = Raft_Large_Weights.DEFAULT
         _RAFT_MODEL = raft_large(weights=weights, progress=False).to(_RAFT_DEVICE)
         _RAFT_MODEL.eval()
@@ -59,7 +60,8 @@ def _init_sam2():
         from sam2.build_sam import build_sam2
         from sam2.sam2_image_predictor import SAM2ImagePredictor
         import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        import os
+        device = "cpu" if os.environ.get("AERO_CPU_ONLY") == "1" else ("cuda" if torch.cuda.is_available() else "cpu")
         # SAM2-large for best accuracy; requires model checkpoint download
         _SAM2_MODEL = SAM2ImagePredictor.from_pretrained("facebook/sam2-hiera-large")
         _SAM2_MODEL.model.to(device)

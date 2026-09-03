@@ -211,6 +211,7 @@ export const App: React.FC = () => {
           viewMode={viewMode}
           tierMode={tierMode}
           clipHeight={clipHeight}
+          pointSize={pointSize}
           showTrajectory={showTrajectory}
         />
 

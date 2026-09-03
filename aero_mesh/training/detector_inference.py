@@ -25,8 +25,8 @@ CLASS_NAMES = [
 # ALL classes are dynamic for 3D reconstruction purposes
 DYNAMIC_CLASS_INDICES = list(range(len(CLASS_NAMES)))  # 0-9 = all dynamic
 
-# Default weights path (updated after training)
-DEFAULT_WEIGHTS = r"E:\Projects\SIH\aero_mesh\training\runs\visdrone_yolo11x\weights\best.pt"
+# Default weights path (points to the active fast training run's latest checkpoint)
+DEFAULT_WEIGHTS = r"E:\Projects\SIH\aero_mesh\training\runs\visdrone_fast\weights\last.pt"
 
 
 class VisDroneDetector:
@@ -74,7 +74,9 @@ class VisDroneDetector:
             from ultralytics import YOLO
             import torch
 
-            if self._device == "auto":
+            if os.environ.get("AERO_CPU_ONLY") == "1":
+                self._device = "cpu"
+            elif self._device == "auto":
                 self._device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
             self._model = YOLO(weights)

@@ -51,6 +51,9 @@ results/
 dataset/
 aero_output/
 .pytest_cache/
+web/public/pointcloud.json
+web/public/flight_plan.json
+web/public/training_status.json
 
 # OS specific
 .DS_Store

@@ -256,56 +256,57 @@ const ObjectMarkers: React.FC<{ objects: ObjectMarker[]; clipHeight: number }> =
 
 /**
  * CityBuildingsOverlay
- * Loads the 63 MB GLB city model. Uses useMemo to prepare a tinted emerald-green
- * wireframe clone ONCE (not on every render). Auto-centers itself over the drone
- * image planes using a Box3 bounding box computed after mount.
- * The GLB has 203 individually accessible building nodes.
+ * Loads the 63 MB GLB city model. Uses original colors.
+ * Automatically scales and centers itself based on the underlying drone images (planes).
  */
-const CityBuildingsOverlay: React.FC = () => {
+const CityBuildingsOverlay: React.FC<{ planes: MeshPlane[] }> = ({ planes }) => {
   const { scene } = useGLTF('/api/assets/buildings.glb');
   const ref = useRef<THREE.Object3D>(null);
 
-  // Prepare tinted clone exactly once when the GLTF scene object changes.
-  // useMemo avoids the "new clone every render" bug that caused scene flickering.
-  const tinted = useMemo(() => {
-    const clone = scene.clone(true);
-    clone.traverse((child) => {
-      const mesh = child as THREE.Mesh;
-      if (!mesh.isMesh) return;
-      // Transparent tinted fill
-      mesh.material = new THREE.MeshBasicMaterial({
-        color: 0x10b981,
-        transparent: true,
-        opacity: 0.15,
-        depthWrite: false,
-        side: THREE.DoubleSide,
-      });
-      // Crisp emerald wireframe edges per building
-      const edges = new THREE.EdgesGeometry(mesh.geometry as THREE.BufferGeometry);
-      mesh.add(new THREE.LineSegments(
-        edges,
-        new THREE.LineBasicMaterial({ color: 0x34d399, transparent: true, opacity: 0.75 })
-      ));
-    });
-    return clone;
-  }, [scene]);
+  const clonedScene = useMemo(() => scene.clone(true), [scene]);
 
-  // After the primitive is mounted, compute its ACTUAL bounding box in world space
-  // and reposition it to be centered over (0, 0, 40) — the middle of the drone strip.
   useEffect(() => {
-    if (!ref.current) return;
-    const box = new THREE.Box3().setFromObject(ref.current);
-    const center = box.getCenter(new THREE.Vector3());
-    // Snap the bottom of the model to y=0 (ground level)
-    // and centre X/Z over the middle of the drone image strip
-    ref.current.position.set(
-      -center.x,
-      -box.min.y,
-      40 - center.z
-    );
-  }, [tinted]);
+    if (!ref.current || !planes || planes.length === 0) return;
 
-  return <primitive ref={ref} object={tinted} scale={[0.75, 0.75, 0.75]} />;
+    // Calculate the bounding box of the drone images (planes)
+    let minX = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxZ = -Infinity;
+    planes.forEach(p => {
+      const halfW = p.w / 2;
+      const halfH = p.h / 2;
+      minX = Math.min(minX, p.x - halfW);
+      maxX = Math.max(maxX, p.x + halfW);
+      minZ = Math.min(minZ, p.y - halfH);
+      maxZ = Math.max(maxZ, p.y + halfH);
+    });
+
+    const planesW = maxX - minX;
+    const planesD = maxZ - minZ;
+    const planesCenterX = (maxX + minX) / 2;
+    const planesCenterZ = (maxZ + minZ) / 2;
+
+    // Calculate bounding box of the city model (before scaling)
+    const box = new THREE.Box3().setFromObject(clonedScene);
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+
+    // Scale the city to match the planes dimensions
+    const scaleX = planesW / size.x;
+    const scaleZ = planesD / size.z;
+    const scale = Math.max(scaleX, scaleZ) * 0.95; // Scale to fit most of the area
+
+    ref.current.scale.set(scale, scale, scale);
+
+    // Position it so the center of the city matches the center of the planes
+    // Also snap the bottom to y=0
+    ref.current.position.set(
+      planesCenterX - (center.x * scale),
+      0 - (box.min.y * scale),
+      planesCenterZ - (center.z * scale)
+    );
+  }, [clonedScene, planes]);
+
+  return <primitive ref={ref} object={clonedScene} />;
 };
 
 /**
@@ -315,21 +316,10 @@ const TreeOverlay: React.FC<{ terrain: TerrainPt[] }> = ({ terrain }) => {
   const fbx = useFBX('/api/assets/tree.fbx');
   const vegPts = terrain.filter(pt => pt.label === 'vegetation').slice(0, 10);
 
-  // Prepare all tree clones in a single top-level useMemo (Rules of Hooks: no hooks inside loops)
+  // Prepare all tree clones in a single top-level useMemo
   const clones = useMemo(() => {
     if (!fbx) return [];
-    return vegPts.map(() => {
-      const c = fbx.clone(true);
-      c.traverse((child) => {
-        if ((child as THREE.Mesh).isMesh) {
-          (child as THREE.Mesh).material = new THREE.MeshBasicMaterial({
-            color: 0x4ade80, transparent: true, opacity: 0.28,
-            depthWrite: false, side: THREE.DoubleSide,
-          });
-        }
-      });
-      return c;
-    });
+    return vegPts.map(() => fbx.clone(true));
   // vegPts.length is the stable dep — fbx only loads once
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fbx, vegPts.length]);
@@ -365,9 +355,9 @@ const ReconstructedMesh: React.FC<PointCloudMeshProps> = ({ cloud, clipHeight })
       <SemanticTerrain terrain={terrain} clipHeight={clipHeight} />
       {/* Thin object markers */}
       <ObjectMarkers objects={objects} clipHeight={clipHeight} />
-      {/* 3D reference overlays: city buildings + trees (wireframe tinted) */}
+      {/* 3D reference overlays: city buildings + trees */}
       <Suspense fallback={null}>
-        <CityBuildingsOverlay />
+        <CityBuildingsOverlay planes={cloud.planes ?? []} />
       </Suspense>
       <Suspense fallback={null}>
         <TreeOverlay terrain={terrain} />

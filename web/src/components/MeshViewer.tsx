@@ -1,7 +1,7 @@
-import React, { useState, useEffect, useRef, useCallback, Suspense } from 'react';
+import React, { useState, useEffect, useRef, useCallback, Suspense, useMemo } from 'react';
 import { Play, Pause, SkipForward, SkipBack, Crosshair, Navigation } from 'lucide-react';
 import { Canvas, useFrame, useThree, useLoader } from '@react-three/fiber';
-import { OrbitControls, PerspectiveCamera } from '@react-three/drei';
+import { OrbitControls, PerspectiveCamera, useGLTF, useFBX } from '@react-three/drei';
 import * as THREE from 'three';
 
 interface MeshViewerProps {
@@ -254,6 +254,97 @@ const ObjectMarkers: React.FC<{ objects: ObjectMarker[]; clipHeight: number }> =
   );
 };
 
+/**
+ * CityBuildingsOverlay
+ * Loads the 63 MB GLB city model. Uses useMemo to prepare a tinted emerald-green
+ * wireframe clone ONCE (not on every render). Auto-centers itself over the drone
+ * image planes using a Box3 bounding box computed after mount.
+ * The GLB has 203 individually accessible building nodes.
+ */
+const CityBuildingsOverlay: React.FC = () => {
+  const { scene } = useGLTF('/api/assets/buildings.glb');
+  const ref = useRef<THREE.Object3D>(null);
+
+  // Prepare tinted clone exactly once when the GLTF scene object changes.
+  // useMemo avoids the "new clone every render" bug that caused scene flickering.
+  const tinted = useMemo(() => {
+    const clone = scene.clone(true);
+    clone.traverse((child) => {
+      const mesh = child as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      // Transparent tinted fill
+      mesh.material = new THREE.MeshBasicMaterial({
+        color: 0x10b981,
+        transparent: true,
+        opacity: 0.15,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      });
+      // Crisp emerald wireframe edges per building
+      const edges = new THREE.EdgesGeometry(mesh.geometry as THREE.BufferGeometry);
+      mesh.add(new THREE.LineSegments(
+        edges,
+        new THREE.LineBasicMaterial({ color: 0x34d399, transparent: true, opacity: 0.75 })
+      ));
+    });
+    return clone;
+  }, [scene]);
+
+  // After the primitive is mounted, compute its ACTUAL bounding box in world space
+  // and reposition it to be centered over (0, 0, 40) — the middle of the drone strip.
+  useEffect(() => {
+    if (!ref.current) return;
+    const box = new THREE.Box3().setFromObject(ref.current);
+    const center = box.getCenter(new THREE.Vector3());
+    // Snap the bottom of the model to y=0 (ground level)
+    // and centre X/Z over the middle of the drone image strip
+    ref.current.position.set(
+      -center.x,
+      -box.min.y,
+      40 - center.z
+    );
+  }, [tinted]);
+
+  return <primitive ref={ref} object={tinted} scale={[0.75, 0.75, 0.75]} />;
+};
+
+/**
+ * TreeOverlay — FBX tree model instanced at detected vegetation points.
+ */
+const TreeOverlay: React.FC<{ terrain: TerrainPt[] }> = ({ terrain }) => {
+  const fbx = useFBX('/api/assets/tree.fbx');
+  const vegPts = terrain.filter(pt => pt.label === 'vegetation').slice(0, 10);
+
+  // Prepare all tree clones in a single top-level useMemo (Rules of Hooks: no hooks inside loops)
+  const clones = useMemo(() => {
+    if (!fbx) return [];
+    return vegPts.map(() => {
+      const c = fbx.clone(true);
+      c.traverse((child) => {
+        if ((child as THREE.Mesh).isMesh) {
+          (child as THREE.Mesh).material = new THREE.MeshBasicMaterial({
+            color: 0x4ade80, transparent: true, opacity: 0.28,
+            depthWrite: false, side: THREE.DoubleSide,
+          });
+        }
+      });
+      return c;
+    });
+  // vegPts.length is the stable dep — fbx only loads once
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fbx, vegPts.length]);
+
+  if (!fbx || clones.length === 0) return null;
+
+  return (
+    <group>
+      {clones.map((clone, i) => (
+        <primitive key={`tree-${i}`} object={clone} scale={[0.003, 0.003, 0.003]} position={[vegPts[i].x, 0, vegPts[i].y]} />
+      ))}
+    </group>
+  );
+};
+
 const ReconstructedMesh: React.FC<PointCloudMeshProps> = ({ cloud, clipHeight }) => {
   const groupRef = useRef<THREE.Group>(null);
   const terrain  = cloud.terrain  ?? [];
@@ -274,6 +365,13 @@ const ReconstructedMesh: React.FC<PointCloudMeshProps> = ({ cloud, clipHeight })
       <SemanticTerrain terrain={terrain} clipHeight={clipHeight} />
       {/* Thin object markers */}
       <ObjectMarkers objects={objects} clipHeight={clipHeight} />
+      {/* 3D reference overlays: city buildings + trees (wireframe tinted) */}
+      <Suspense fallback={null}>
+        <CityBuildingsOverlay />
+      </Suspense>
+      <Suspense fallback={null}>
+        <TreeOverlay terrain={terrain} />
+      </Suspense>
     </group>
   );
 };

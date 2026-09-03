@@ -13,6 +13,16 @@ const TRAINING_DIR = path.resolve(
   '../aero_mesh/training/runs/visdrone_fast'
 );
 
+const BUILDINGS_GLB = path.resolve(
+  __dirname,
+  '../full-gameready-city-buildings/source/full_gameready_city_buildings.glb'
+);
+
+const TREE_FBX = path.resolve(
+  __dirname,
+  '../mystical-x-tree-viii/source/55-3_png.fbx'
+);
+
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [
@@ -77,6 +87,31 @@ export default defineConfig({
           } else {
             res.statusCode = 404;
             res.end('Not found');
+          }
+        });
+        // ── Serve 3D city buildings GLB at /api/assets/buildings.glb ────────
+        server.middlewares.use('/api/assets/buildings.glb', (_req, res) => {
+          if (fs.existsSync(BUILDINGS_GLB)) {
+            res.setHeader('Content-Type', 'model/gltf-binary');
+            res.setHeader('Cache-Control', 'public, max-age=86400');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            fs.createReadStream(BUILDINGS_GLB).pipe(res as any);
+          } else {
+            res.statusCode = 404;
+            res.end('buildings.glb not found');
+          }
+        });
+
+        // ── Serve tree FBX at /api/assets/tree.fbx ────────────────────────────
+        server.middlewares.use('/api/assets/tree.fbx', (_req, res) => {
+          if (fs.existsSync(TREE_FBX)) {
+            res.setHeader('Content-Type', 'application/octet-stream');
+            res.setHeader('Cache-Control', 'public, max-age=86400');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            fs.createReadStream(TREE_FBX).pipe(res as any);
+          } else {
+            res.statusCode = 404;
+            res.end('tree.fbx not found');
           }
         });
       },

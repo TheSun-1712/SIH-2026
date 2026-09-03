@@ -24,29 +24,41 @@ interface FrameEntry  { filename: string; frameOffset: number; }
 interface Sequence    { seqId: string; frameCount: number; frames: FrameEntry[]; trajectoryPoints: TrajectoryPoint[]; }
 interface FlightPlan  { generatedAt: string; totalImages: number; sequences: Sequence[]; originLatLon: [number, number]; }
 
-// ── pointcloud.json types ─────────────────────────────────────────────────────
+// ── pointcloud.json types (semantic terrain schema) ─────────────────────────
 interface MeshPlane {
   filename: string;
   x: number; y: number; z: number;
   w: number; h: number; frame: number;
 }
-interface MeshBox {
+interface TerrainPt {
+  x: number; y: number;       // world X / Z position (Three.js uses Y-up)
+  h: number;                  // height in world units
+  label: string;              // 'road' | 'vegetation' | 'building' | 'water' | 'ground'
+  color: string;              // hex color
+  frame: number;
+}
+interface ObjectMarker {
   x: number; y: number; z: number;
   w: number; h: number; d: number;
-  r: number; g: number; b: number;
-  conf: number; cls: number; label: string; frame: number;
+  cls: number; label: string; color: string; conf: number; frame: number;
 }
 interface PointCloud {
   generatedAt: string;
-  weightsUsed: string;
-  epochAtExport: number;
-  mAP50AtExport: number;
-  modelName: string;
-  classNames: string[];
-  nc: number;
-  classColors: Record<string, [number, number, number]>;
-  planes: MeshPlane[];
-  boxes: MeshBox[];
+  depthBackend: string;
+  stats: {
+    numImages: number;
+    numTerrain: number;
+    numObjects: number;
+    epochAtExport: number;
+    mAP50AtExport: number;
+    modelName: string;
+    sampleStride: number;
+  };
+  planes:   MeshPlane[];
+  terrain:  TerrainPt[];
+  objects:  ObjectMarker[];
+  // Legacy support (old schema fallback)
+  boxes?:   any[];
 }
 
 // ── VisDrone annotation categories ───────────────────────────────────────────
@@ -142,63 +154,126 @@ function sourceToColor(tag: number): [number, number, number] {
   return [244, 63, 94];                      // 3DGS – rose
 }
 
+
+// ── Textured image plane (renders the drone photo flat on the ground) ─────────
 interface PointCloudMeshProps {
   cloud: PointCloud;
   viewMode: 'rgb' | 'heatmap' | 'source';
   clipHeight: number;
-  pointSize: number; // Ignored for mesh view, but kept for interface compatibility
+  pointSize: number;
 }
 
-const TexturedPlane: React.FC<{ plane: MeshPlane }> = ({ plane }) => {
+const TexturedPlane: React.FC<{ plane: MeshPlane; index: number }> = ({ plane }) => {
   const texture = useLoader(THREE.TextureLoader, `/drone/${plane.filename}`);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  // Move plane to y=-0.3 so it sits BELOW all terrain geometry (which starts at y=0).
+  // polygonOffset pushes it further away from the camera to prevent Z-fighting.
   return (
-    <mesh position={[plane.x, plane.z, plane.y]} rotation={[-Math.PI / 2, 0, 0]}>
+    <mesh position={[plane.x, -0.3, plane.y]} rotation={[-Math.PI / 2, 0, 0]}>
       <planeGeometry args={[plane.w, plane.h]} />
-      <meshBasicMaterial map={texture} side={THREE.DoubleSide} />
+      <meshBasicMaterial
+        map={texture}
+        side={THREE.DoubleSide}
+        depthWrite={true}
+        polygonOffset={true}
+        polygonOffsetFactor={2}
+        polygonOffsetUnits={2}
+      />
     </mesh>
   );
 };
 
-const ReconstructedMesh: React.FC<PointCloudMeshProps> = ({ cloud, viewMode, clipHeight }) => {
-  const groupRef = useRef<THREE.Group>(null);
+// ── Terrain label → geometry type ────────────────────────────────────────────
 
-  // Slow auto-rotate when not interacting
-  useFrame((_, delta) => {
-    if (groupRef.current) {
-      groupRef.current.rotation.y += delta * 0.03;
-    }
-  });
+function terrainShape(pt: TerrainPt): THREE.BufferGeometry {
+  // Use a consistent footprint that covers the sampling stride area.
+  // stride=25px * phys_scale(0.05) = 1.25 world units per sample.
+  // Make each tile slightly larger (1.3) so there are no gaps between tiles.
+  const tileW = 1.3;
+  const tileD = 1.3;
+  switch (pt.label) {
+    case 'vegetation':
+      return new THREE.ConeGeometry(tileW * 0.55, pt.h, 6);
+    case 'building':
+      return new THREE.BoxGeometry(tileW, pt.h, tileD);
+    case 'water':
+      return new THREE.BoxGeometry(tileW, 0.04, tileD);
+    case 'road':
+    case 'ground':
+    default:
+      return new THREE.BoxGeometry(tileW, Math.max(pt.h, 0.06), tileD);
+  }
+}
 
+// Terrain renderer: one mesh per sampled terrain point
+const SemanticTerrain: React.FC<{ terrain: TerrainPt[]; clipHeight: number }> = ({ terrain, clipHeight }) => {
+  const filtered = terrain.filter(pt => pt.h <= clipHeight);
   return (
-    <group ref={groupRef}>
-      {cloud.planes?.map((plane, i) => (
-        <TexturedPlane key={i} plane={plane} />
-      ))}
-      
-      {cloud.boxes?.filter(b => b.z <= clipHeight).map((box, i) => {
-        let r, g, b;
-        if (viewMode === 'rgb') {
-          r = box.r / 255; g = box.g / 255; b = box.b / 255;
-        } else if (viewMode === 'heatmap') {
-          [r, g, b] = confToColor(box.conf).map(v => v / 255) as [number, number, number];
-        } else {
-          // source: use class color as proxy for source origin
-          const srcTag = box.conf > 0.5 ? 1.0 : 0.4;
-          [r, g, b] = sourceToColor(srcTag).map(v => v / 255) as [number, number, number];
-        }
-        const color = new THREE.Color(r, g, b);
-        
+    <group>
+      {filtered.map((pt, i) => {
+        const geom  = terrainShape(pt);
+        const color = pt.color;
+        const yPos  = pt.h / 2;  // centre of geometry sits at half-height above ground
+        const opacity = pt.label === 'road' || pt.label === 'ground' ? 0.55 : 0.75;
         return (
-          <mesh key={`box-${i}`} position={[box.x, box.z, box.y]}>
-            <boxGeometry args={[box.w, box.h, box.d]} />
-            <meshBasicMaterial color={color} transparent opacity={0.5} depthWrite={false} />
-            <lineSegments>
-              <edgesGeometry args={[new THREE.BoxGeometry(box.w, box.h, box.d)]} />
-              <lineBasicMaterial color={color} transparent opacity={0.9} />
+          <mesh key={`t-${i}`} position={[pt.x, yPos, pt.y]} geometry={geom}>
+            <meshBasicMaterial color={color} transparent opacity={opacity} depthWrite={false} />
+            {(pt.label === 'building' || pt.label === 'vegetation') && (
+              <lineSegments geometry={new THREE.EdgesGeometry(geom)}>
+                <lineBasicMaterial color={color} transparent opacity={0.6} />
+              </lineSegments>
+            )}
+          </mesh>
+        );
+      })}
+    </group>
+  );
+};
+
+// Object marker renderer: thin wireframe slabs for detected vehicles/people
+const ObjectMarkers: React.FC<{ objects: ObjectMarker[]; clipHeight: number }> = ({ objects, clipHeight }) => {
+  return (
+    <group>
+      {objects.filter(o => o.h <= clipHeight).map((obj, i) => {
+        let geom: THREE.BufferGeometry;
+        if (obj.label === 'Pedestrian' || obj.label === 'People') {
+          geom = new THREE.CapsuleGeometry(Math.max(obj.w, obj.d) / 2.5, obj.h / 2, 4, 8);
+        } else {
+          geom = new THREE.BoxGeometry(obj.w, obj.h, obj.d);
+        }
+        return (
+          <mesh key={`o-${i}`} position={[obj.x, obj.h / 2, obj.y]} geometry={geom}>
+            <meshBasicMaterial color={obj.color} transparent opacity={0.15} depthWrite={false} />
+            <lineSegments geometry={new THREE.EdgesGeometry(geom)}>
+              <lineBasicMaterial color={obj.color} linewidth={1} />
             </lineSegments>
           </mesh>
         );
       })}
+    </group>
+  );
+};
+
+const ReconstructedMesh: React.FC<PointCloudMeshProps> = ({ cloud, clipHeight }) => {
+  const groupRef = useRef<THREE.Group>(null);
+  const terrain  = cloud.terrain  ?? [];
+  const objects  = cloud.objects  ?? cloud.boxes ?? [];
+
+  // Gentle auto-rotate
+  useFrame((_, delta) => {
+    if (groupRef.current) groupRef.current.rotation.y += delta * 0.025;
+  });
+
+  return (
+    <group ref={groupRef}>
+      {/* Ground-truth image planes */}
+      {cloud.planes?.map((plane, i) => (
+        <TexturedPlane key={i} plane={plane} index={i} />
+      ))}
+      {/* Semantic terrain geometry */}
+      <SemanticTerrain terrain={terrain} clipHeight={clipHeight} />
+      {/* Thin object markers */}
+      <ObjectMarkers objects={objects} clipHeight={clipHeight} />
     </group>
   );
 };
@@ -215,21 +290,21 @@ const PointCloudViewer: React.FC<PointCloudViewerProps> = ({ cloud, viewMode, cl
     style={{ width: '100%', height: '100%', background: '#060b14' }}
     gl={{ antialias: true, alpha: true }}
   >
-    <PerspectiveCamera makeDefault position={[0, 8, 28]} fov={55} />
-    <ambientLight intensity={0.6} />
-    <pointLight position={[10, 20, 10]} intensity={0.8} />
+    <PerspectiveCamera makeDefault position={[0, 80, 110]} fov={55} />
+    <ambientLight intensity={0.8} />
+    <directionalLight position={[50, 100, 50]} intensity={0.6} castShadow />
     <Suspense fallback={null}>
       <ReconstructedMesh cloud={cloud} viewMode={viewMode} clipHeight={clipHeight} pointSize={pointSize} />
     </Suspense>
     <OrbitControls
       enableDamping
       dampingFactor={0.08}
-      minDistance={3}
-      maxDistance={80}
+      minDistance={10}
+      maxDistance={500}
       makeDefault
     />
-    {/* Grid floor */}
-    <gridHelper args={[40, 20, '#0f2040', '#0d1a2e']} />
+      {/* Grid floor scaled to match scene — planes span 96 wide x 85 deep */}
+      <gridHelper args={[200, 40, '#0f2040', '#0d1a2e']} />
   </Canvas>
 );
 
@@ -307,12 +382,12 @@ const Tier2View: React.FC<Tier2ViewProps> = ({ viewMode, clipHeight, pointSize }
         display: 'flex', gap: 8, pointerEvents: 'none', flexWrap: 'wrap', justifyContent: 'center',
       }}>
         {[
-          { label: 'EPOCH', value: String(cloud.epochAtExport) },
-          { label: 'mAP50', value: `${(cloud.mAP50AtExport * 100).toFixed(1)}%` },
-          { label: 'PLANES', value: cloud.planes?.length.toLocaleString() ?? '0' },
-          { label: 'BOXES', value: cloud.boxes?.length.toLocaleString() ?? '0' },
-          { label: 'MODEL', value: cloud.modelName.toUpperCase() },
-          { label: 'CLASSES', value: String(cloud.nc) },
+          { label: 'EPOCH',   value: String(cloud.stats?.epochAtExport ?? cloud.epochAtExport ?? '–') },
+          { label: 'mAP50',   value: `${((cloud.stats?.mAP50AtExport ?? cloud.mAP50AtExport ?? 0) * 100).toFixed(1)}%` },
+          { label: 'TERRAIN', value: (cloud.stats?.numTerrain ?? cloud.terrain?.length ?? 0).toLocaleString() },
+          { label: 'OBJECTS', value: (cloud.stats?.numObjects ?? cloud.objects?.length ?? 0).toLocaleString() },
+          { label: 'DEPTH',   value: (cloud.depthBackend ?? 'n/a').toUpperCase() },
+          { label: 'MODEL',   value: (cloud.stats?.modelName ?? cloud.modelName ?? 'YOLO').toUpperCase() },
         ].map(({ label, value }) => (
           <div key={label} style={{
             background: 'rgba(6,11,20,0.82)', backdropFilter: 'blur(8px)',

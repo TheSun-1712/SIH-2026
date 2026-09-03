@@ -59,3 +59,9 @@ web/public/training_status.json
 .DS_Store
 Thumbs.db
 .gemini/
+
+# Downloaded 3D assets & zip archives
+*.zip
+free-london-skyscraper/
+full-gameready-city-buildings/
+mystical-x-tree-viii/

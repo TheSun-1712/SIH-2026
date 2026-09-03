@@ -719,8 +719,8 @@ const Tier1View: React.FC<Tier1ViewProps> = ({ viewMode, showTrajectory }) => {
               `${(p.vx / 100) * rendered.w},${(p.vy / 100) * rendered.h}`
             ).join(' ')}
             fill="none"
-            stroke="rgba(56,189,248,0.35)"
-            strokeWidth="1.5"
+            stroke="rgba(56,189,248,0.85)"
+            strokeWidth="3.5"
             strokeLinecap="round"
             strokeLinejoin="round"
           />

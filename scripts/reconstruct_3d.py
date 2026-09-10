@@ -375,6 +375,14 @@ def main():
         depth_norm = predict_depth(depth_pipe, img)
         print(f"[Recon]     depth: {time.time()-t0:.1f}s ({depth_backend})")
 
+        # Save depth heatmap for Tier 1 Visualizer
+        heatmap_dir = os.path.join("web", "public", "drone")
+        os.makedirs(heatmap_dir, exist_ok=True)
+        depth_uint8 = (depth_norm * 255).astype(np.uint8)
+        depth_color = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_INFERNO)
+        heatmap_filename = filename.replace(".jpg", "_depth.jpg")
+        cv2.imwrite(os.path.join(heatmap_dir, heatmap_filename), depth_color)
+
         # Semantic terrain sampling
         t0 = time.time()
         terrain = build_terrain_from_image(

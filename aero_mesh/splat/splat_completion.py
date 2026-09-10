@@ -148,7 +148,7 @@ class GaussianSplatCompletion:
 
     def _run_splatfacto(self, data_dir: str) -> Optional[Dict[str, np.ndarray]]:
         """
-        Runs Nerfstudio Splatfacto training via CLI.
+        Runs Nerfstudio Splatfacto training via CLI with Max Accuracy and Checkpointing.
         Expects ns-processed data in data_dir.
         Returns extra completed points or None on failure.
         """
@@ -161,15 +161,30 @@ class GaussianSplatCompletion:
             "--data", data_dir,
             "--output-dir", self.nerfstudio_output_dir,
             "--viewer.quit-on-train-completion", "True",
-            "--max-num-iterations", "10000",
-            "--pipeline.model.num-downscales", "2",
+            "--max-num-iterations", "30000",          # Max accuracy iterations
+            "--pipeline.model.num-downscales", "0",   # Use full resolution
+            "nerfstudio-data", "--eval-mode", "fraction",
         ]
+
+        # Check for existing checkpoint to resume
+        import glob
+        checkpoint_dirs = glob.glob(os.path.join(self.nerfstudio_output_dir, "*", "nerfstudio_models"))
+        if checkpoint_dirs:
+            latest_ckpt_dir = max(checkpoint_dirs, key=os.path.getmtime)
+            # Find the actual .ckpt file
+            ckpts = glob.glob(os.path.join(latest_ckpt_dir, "*.ckpt"))
+            if ckpts:
+                latest_ckpt = max(ckpts, key=os.path.getmtime)
+                print(f"[Splat] Found checkpoint, resuming from: {latest_ckpt}")
+                cmd.extend(["--load-checkpoint", latest_ckpt])
+
         try:
             print(f"[Splat] Running Splatfacto: {' '.join(cmd)}")
-            result = subprocess.run(cmd, timeout=3600, capture_output=True, text=True)
+            result = subprocess.run(cmd, timeout=86400, capture_output=True, text=True) # 24h timeout
             if result.returncode == 0:
                 print("[Splat] ✓ Splatfacto training complete.")
-                return None  # TODO: parse exported splat cloud
+                # TODO: parse exported splat cloud
+                return None
             else:
                 print(f"[Splat] Splatfacto error: {result.stderr[:500]}")
         except subprocess.TimeoutExpired:

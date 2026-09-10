@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, Suspense, useMemo } from 'react';
 import { Play, Pause, SkipForward, SkipBack, Crosshair, Navigation } from 'lucide-react';
 import { Canvas, useFrame, useThree, useLoader } from '@react-three/fiber';
-import { OrbitControls, PerspectiveCamera, useGLTF, useFBX } from '@react-three/drei';
+import { OrbitControls, PerspectiveCamera, useGLTF, useFBX, Splat, Clone } from '@react-three/drei';
 import * as THREE from 'three';
 
 interface MeshViewerProps {
@@ -205,31 +205,6 @@ function terrainShape(pt: TerrainPt): THREE.BufferGeometry {
   }
 }
 
-// Terrain renderer: one mesh per sampled terrain point
-const SemanticTerrain: React.FC<{ terrain: TerrainPt[]; clipHeight: number }> = ({ terrain, clipHeight }) => {
-  const filtered = terrain.filter(pt => pt.h <= clipHeight);
-  return (
-    <group>
-      {filtered.map((pt, i) => {
-        const geom  = terrainShape(pt);
-        const color = pt.color;
-        const yPos  = pt.h / 2;  // centre of geometry sits at half-height above ground
-        const opacity = pt.label === 'road' || pt.label === 'ground' ? 0.55 : 0.75;
-        return (
-          <mesh key={`t-${i}`} position={[pt.x, yPos, pt.y]} geometry={geom}>
-            <meshBasicMaterial color={color} transparent opacity={opacity} depthWrite={false} />
-            {(pt.label === 'building' || pt.label === 'vegetation') && (
-              <lineSegments geometry={new THREE.EdgesGeometry(geom)}>
-                <lineBasicMaterial color={color} transparent opacity={0.6} />
-              </lineSegments>
-            )}
-          </mesh>
-        );
-      })}
-    </group>
-  );
-};
-
 // Object marker renderer: thin wireframe slabs for detected vehicles/people
 const ObjectMarkers: React.FC<{ objects: ObjectMarker[]; clipHeight: number }> = ({ objects, clipHeight }) => {
   return (
@@ -247,6 +222,69 @@ const ObjectMarkers: React.FC<{ objects: ObjectMarker[]; clipHeight: number }> =
             <lineSegments geometry={new THREE.EdgesGeometry(geom)}>
               <lineBasicMaterial color={obj.color} linewidth={1} />
             </lineSegments>
+          </mesh>
+        );
+      })}
+    </group>
+  );
+};
+
+/**
+ * DynamicBuildingOverlay — Procedurally instances the beautiful GLB building models
+ * at the exact coordinates detected by the live AI (semantic terrain points).
+ */
+const DynamicBuildingOverlay: React.FC<{ terrain: TerrainPt[] }> = ({ terrain }) => {
+  const { scene } = useGLTF('/api/assets/buildings.glb');
+  const bldgPts = terrain.filter(pt => pt.label === 'building');
+  
+  // Extract a single building mesh from the city GLB to use as an instance.
+  // In a real scenario we might map multiple meshes, but here we pick the first valid mesh.
+  const bldgMesh = useMemo(() => {
+    let mesh: THREE.Mesh | null = null;
+    scene.traverse((child) => {
+      if ((child as THREE.Mesh).isMesh && !mesh) {
+        mesh = child as THREE.Mesh;
+      }
+    });
+    return mesh || scene; // fallback to whole scene if no mesh found
+  }, [scene]);
+
+  if (!bldgMesh || bldgPts.length === 0) return null;
+
+  return (
+    <group>
+      {bldgPts.map((pt, i) => {
+        // Scale the mesh to match the detected building dimensions
+        const scaleX = 1.3 / 100; // approximate scale down from the large city mesh
+        const scaleY = pt.h / 100;
+        const scaleZ = 1.3 / 100;
+        return (
+          <Clone 
+            key={`bldg-${i}`} 
+            object={bldgMesh} 
+            scale={[scaleX, scaleY, scaleZ]} 
+            position={[pt.x, 0, pt.y]} 
+          />
+        );
+      })}
+    </group>
+  );
+};
+
+// Terrain renderer: renders roads and ground dynamically
+const SemanticTerrain: React.FC<{ terrain: TerrainPt[]; clipHeight: number }> = ({ terrain, clipHeight }) => {
+  // We only render non-building semantic points here because buildings and vegetation are handled by dynamic FBX overlays.
+  const filtered = terrain.filter(pt => pt.h <= clipHeight && pt.label !== 'building' && pt.label !== 'vegetation');
+  return (
+    <group>
+      {filtered.map((pt, i) => {
+        const geom  = terrainShape(pt);
+        const color = pt.color;
+        const yPos  = pt.h / 2;
+        const opacity = pt.label === 'road' || pt.label === 'ground' ? 0.55 : 0.75;
+        return (
+          <mesh key={`t-${i}`} position={[pt.x, yPos, pt.y]} geometry={geom}>
+            <meshBasicMaterial color={color} transparent opacity={opacity} depthWrite={false} />
           </mesh>
         );
       })}
@@ -316,20 +354,17 @@ const TreeOverlay: React.FC<{ terrain: TerrainPt[] }> = ({ terrain }) => {
   const fbx = useFBX('/api/assets/tree.fbx');
   const vegPts = terrain.filter(pt => pt.label === 'vegetation').slice(0, 10);
 
-  // Prepare all tree clones in a single top-level useMemo
-  const clones = useMemo(() => {
-    if (!fbx) return [];
-    return vegPts.map(() => fbx.clone(true));
-  // vegPts.length is the stable dep — fbx only loads once
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fbx, vegPts.length]);
-
-  if (!fbx || clones.length === 0) return null;
+  if (!fbx || vegPts.length === 0) return null;
 
   return (
     <group>
-      {clones.map((clone, i) => (
-        <primitive key={`tree-${i}`} object={clone} scale={[0.003, 0.003, 0.003]} position={[vegPts[i].x, 0, vegPts[i].y]} />
+      {vegPts.map((pt, i) => (
+        <Clone 
+          key={`tree-${i}`} 
+          object={fbx} 
+          scale={[0.003, 0.003, 0.003]} 
+          position={[pt.x, 0, pt.y]} 
+        />
       ))}
     </group>
   );
@@ -351,11 +386,11 @@ const ReconstructedMesh: React.FC<PointCloudMeshProps> = ({ cloud, clipHeight })
       {cloud.planes?.map((plane, i) => (
         <TexturedPlane key={i} plane={plane} index={i} />
       ))}
-      {/* Semantic terrain geometry */}
+      {/* Semantic terrain geometry (roads, ground) */}
       <SemanticTerrain terrain={terrain} clipHeight={clipHeight} />
       {/* Thin object markers */}
       <ObjectMarkers objects={objects} clipHeight={clipHeight} />
-      {/* 3D reference overlays: city buildings + trees */}
+      {/* Dynamic 3D FBX overlays: buildings + trees */}
       <Suspense fallback={null}>
         <CityBuildingsOverlay planes={cloud.planes ?? []} />
       </Suspense>
@@ -443,6 +478,7 @@ interface Tier2ViewProps {
 const Tier2View: React.FC<Tier2ViewProps> = ({ viewMode, clipHeight, pointSize }) => {
   const [cloud, setCloud] = useState<PointCloud | null>(null);
   const [epoch, setEpoch] = useState(0);
+  const [showSplat, setShowSplat] = useState(false);
 
   useEffect(() => {
     // Load epoch from training_status.json
@@ -462,7 +498,51 @@ const Tier2View: React.FC<Tier2ViewProps> = ({ viewMode, clipHeight, pointSize }
 
   return (
     <div style={{ width: '100%', height: '100%', position: 'relative' }}>
-      <PointCloudViewer cloud={cloud} viewMode={viewMode} clipHeight={clipHeight} pointSize={pointSize} />
+      {showSplat ? (
+        <Canvas style={{ width: '100%', height: '100%', background: '#060b14' }}>
+          <PerspectiveCamera makeDefault position={[0, 80, 110]} fov={55} />
+          <ambientLight intensity={0.8} />
+          <Suspense fallback={null}>
+            {/* The splat file exported by Nerfstudio */}
+            <Splat src="/api/assets/reconstruction.splat" />
+          </Suspense>
+          <OrbitControls makeDefault />
+        </Canvas>
+      ) : (
+        <PointCloudViewer cloud={cloud} viewMode={viewMode} clipHeight={clipHeight} pointSize={pointSize} />
+      )}
+
+      {/* View Toggle */}
+      <div style={{
+        position: 'absolute', top: 50, left: 10, zIndex: 10,
+        display: 'flex', gap: 4, background: 'rgba(15,23,42,0.8)',
+        padding: 4, borderRadius: 6, border: '1px solid rgba(56,189,248,0.2)'
+      }}>
+        <button
+          onClick={() => setShowSplat(false)}
+          style={{
+            padding: '4px 12px', fontSize: 11, fontWeight: 600,
+            background: !showSplat ? '#38bdf8' : 'transparent',
+            color: !showSplat ? '#0f172a' : '#94a3b8',
+            border: 'none', borderRadius: 4, cursor: 'pointer',
+            transition: 'all 0.2s'
+          }}
+        >
+          Semantic Proxy
+        </button>
+        <button
+          onClick={() => setShowSplat(true)}
+          style={{
+            padding: '4px 12px', fontSize: 11, fontWeight: 600,
+            background: showSplat ? '#38bdf8' : 'transparent',
+            color: showSplat ? '#0f172a' : '#94a3b8',
+            border: 'none', borderRadius: 4, cursor: 'pointer',
+            transition: 'all 0.2s'
+          }}
+        >
+          Photorealistic (3DGS)
+        </button>
+      </div>
 
       {/* Info overlay */}
       <div style={{
@@ -602,6 +682,7 @@ const Tier1View: React.FC<Tier1ViewProps> = ({ viewMode, showTrajectory }) => {
   const renderedBottom = rendered.top  + rendered.h;
 
   const imgUrl = currentFrame ? `/drone/${currentFrame.filename}` : null;
+  const depthImgUrl = currentFrame ? `/drone/${currentFrame.filename.replace('.jpg', '_depth.jpg')}` : null;
 
   return (
     <div
@@ -628,6 +709,26 @@ const Tier1View: React.FC<Tier1ViewProps> = ({ viewMode, showTrajectory }) => {
             filter: VIEW_FILTER[viewMode] ?? 'none',
             opacity: imgLoaded ? 1 : 0,
             transition: 'opacity 0.3s ease, filter 0.4s ease',
+          }}
+        />
+      )}
+
+      {/* Depth Image Overlay for Heatmap mode */}
+      {depthImgUrl && (
+        <img
+          key={depthImgUrl}
+          src={depthImgUrl}
+          alt={`Depth map for ${frameIdx + 1}`}
+          style={{
+            position: 'absolute', top: 0, left: 0,
+            width: '100%',
+            height: `calc(100% - 70px)`,
+            objectFit: 'contain',
+            objectPosition: 'center',
+            opacity: viewMode === 'heatmap' && imgLoaded ? 0.75 : 0,
+            transition: 'opacity 0.4s ease',
+            mixBlendMode: 'screen',
+            pointerEvents: 'none',
           }}
         />
       )}

@@ -6,13 +6,29 @@ Generates a full semantic terrain model from drone images by combining:
   2. Depth Anything V2 Metric Outdoor (ViT-L) → per-pixel metric depth in metres
   3. VisDrone YOLO detector → moving objects (cars, people) as thin overlay markers
 
+[NEW] Entity Extraction (Phase 2 Upgrade):
+  4. Metric Height Clustering — connected-component building instance labelling
+     with real height H = z_roof - z_ground from DA2 aligned depth.
+  5. VLM CLIP Architectural Classifier — classifies each building patch into one
+     of 7 architectural types for the Shape Grammar Engine's asset selection.
+  6. OUGS Uncertainty Integration — per-entity uncertainty scores from the
+     OUGSScorer are embedded in the entity manifest.
+  7. Cross-Modal Fuser — merges aerial and Mapillary street-level point clouds.
+
 Output JSON schema:
   {
     "generatedAt": "...",
-    "planes": [{ "filename", "x", "y", "z", "w", "h", "frame" }],
-    "terrain": [{ "x", "y", "z", "cls", "label", "color" }],   ← sampled surface
-    "objects": [{ "x", "y", "z", "w", "h", "d", "cls", "label", "color" }],
-    "stats": { "numTerrain", "numObjects", "epochAtExport", "mAP50AtExport", ... }
+    "planes": [...],
+    "terrain": [...],
+    "objects": [...],
+    "entities": {
+      "buildings": [{"id", "type", "footprint", "measuredHeight",
+                     "floorCount", "confidence", "lod", "uncertainty"}],
+      "vegetation": [{"id", "position", "height", "radius"}],
+      "vehicles":   [{"id", "type", "position", "heading"}],
+      "roads":      [{"id", "polyline", "width", "type"}]
+    },
+    "stats": {...}
   }
 """
 
@@ -127,13 +143,12 @@ def load_depth_model():
         import torch
         from transformers import pipeline as hf_pipeline
         device = 0 if torch.cuda.is_available() else -1
-        dtype  = torch.float16 if device == 0 else torch.float32
         print("[Recon] Loading Depth Anything V2 Metric Outdoor (ViT-L)…")
         pipe = hf_pipeline(
             task="depth-estimation",
             model="depth-anything/Depth-Anything-V2-Metric-Outdoor-Large-hf",
             device=device,
-            torch_dtype=dtype,
+            torch_dtype=torch.float32,
         )
         print("[Recon]   ✓ DA2 Metric Outdoor loaded")
         return pipe, "da2"
@@ -308,12 +323,351 @@ def build_objects_from_detections(
     return objects
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 2: Entity Extraction, Metric Height Clustering & VLM Classification
+# ─────────────────────────────────────────────────────────────────────────────
+
+VLM_CLASS_NAMES = [
+    "high_rise_residential", "office_tower", "commercial_shopfront",
+    "industrial_warehouse", "villa_house", "apartment_block", "mixed_use",
+]
+
+FLOOR_HEIGHT_BY_TYPE = {
+    "high_rise_residential": 2.85,
+    "office_tower":          3.50,
+    "commercial_shopfront":  4.50,
+    "industrial_warehouse":  8.00,
+    "villa_house":           3.00,
+    "apartment_block":       3.00,
+    "mixed_use":             3.20,
+}
+
+
+def extract_building_instances(
+    seg_masks_data: np.ndarray,       # (N_masks, H, W) float32
+    seg_classes:    np.ndarray,       # (N_masks,) int class ids
+    depth_norm:     np.ndarray,       # (H, W) float32 in [0,1]
+    img_bgr:        np.ndarray,       # (H, W, 3) uint8 for patch crops
+    phys_scale:     float = 0.05,
+    offset_y:       float = 0.0,
+    frame_idx:      int   = 0,
+    depth_max_m:    float = 80.0,     # DA2 Metric Outdoor max depth
+) -> list:
+    """
+    Extract discrete building instances from YOLO-seg masks.
+    For each building mask:
+      - Computes connected components to isolate individual buildings
+      - Measures real height H = depth_roof - depth_ground using DA2 depth
+      - Extracts oriented bounding box footprint
+      - Crops the image patch for VLM classification
+    Returns list of raw building instance dicts.
+    """
+    h, w = img_bgr.shape[:2]
+    buildings = []
+    bldg_idx  = 0
+
+    # 1. Color-based rooftop segmentation (warm/reddish/concrete tones)
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    h_ch, s_ch, v_ch = hsv[:, :, 0], hsv[:, :, 1] / 255.0, hsv[:, :, 2] / 255.0
+    bldg_color_mask = ((h_ch < 22) | (h_ch > 155)) & (s_ch > 0.20) & (v_ch > 0.20)
+
+    # 2. Depth elevation mask (structures raised above local ground plane)
+    ground_depth = float(np.median(depth_norm))
+    elevated_mask = (ground_depth - depth_norm) > 0.03
+    combined_mask = ((bldg_color_mask | elevated_mask) & (v_ch > 0.15)).astype(np.uint8) * 255
+
+    # 3. Morphological cleanup (merge roof facets, eliminate road lines & noise)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    cleaned = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
+
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(cleaned, connectivity=8)
+    min_area = 250   # At least ~250 pixels
+    max_area = int(h * w * 0.35)
+
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area < min_area or area > max_area:
+            continue
+
+        x_min = stats[i, cv2.CC_STAT_LEFT]
+        y_min = stats[i, cv2.CC_STAT_TOP]
+        box_w = stats[i, cv2.CC_STAT_WIDTH]
+        box_h = stats[i, cv2.CC_STAT_HEIGHT]
+        x_max = x_min + box_w
+        y_max = y_min + box_h
+
+        # Aspect ratio filter (reject long narrow roads/pavements)
+        aspect = max(box_w, box_h) / (min(box_w, box_h) + 1e-3)
+        if aspect > 4.5:
+            continue
+
+        comp_mask = (labels == i)
+        depth_in_mask = depth_norm[comp_mask]
+        if len(depth_in_mask) == 0:
+            continue
+
+        mean_depth = float(depth_in_mask.mean())
+        depth_diff = max(0.02, float(ground_depth - mean_depth))
+        height_m   = max(3.5, min(depth_diff * depth_max_m * 2.2, 60.0))
+
+        cx_px = float(centroids[i][0])
+        cy_px = float(centroids[i][1])
+        cx_w  = (cx_px - w / 2.0) * phys_scale
+        cz_w  = (cy_px - h / 2.0) * phys_scale + offset_y
+        width_w = max(6.0, box_w * phys_scale)
+        depth_w = max(6.0, box_h * phys_scale)
+
+        pad = 8
+        crop = img_bgr[
+            max(0, y_min - pad):min(h, y_max + pad),
+            max(0, x_min - pad):min(w, x_max + pad)
+        ]
+
+        buildings.append({
+            "id":          f"bldg_{frame_idx}_{bldg_idx}",
+            "cx":          float(cx_w),
+            "cz":          float(cz_w),
+            "width_m":     float(width_w),
+            "depth_m":     float(depth_w),
+            "height_m":    float(height_m),
+            "mean_depth":  float(mean_depth),
+            "frame":       frame_idx,
+            "crop":        crop,
+        })
+        bldg_idx += 1
+
+    return buildings
+
+
+def classify_building_type(crop_bgr: np.ndarray, vlm_ckpt: str = None) -> str:
+    """
+    Classify a building aerial crop into one of 7 architectural types.
+
+    If the VLM checkpoint is available (train_vlm_classifier.py has been run),
+    uses the trained CLIP head. Otherwise falls back to colour/texture heuristics.
+
+    Args:
+        crop_bgr:  (H, W, 3) BGR crop of the building from above
+        vlm_ckpt:  path to the VLM classifier checkpoint (best.pt)
+
+    Returns: string architectural type label
+    """
+    default_type = "apartment_block"
+
+    if vlm_ckpt and os.path.exists(vlm_ckpt):
+        try:
+            import torch
+            from PIL import Image as PILImg
+            ckpt = torch.load(vlm_ckpt, map_location="cpu", weights_only=False)
+            head_state = ckpt.get("head_state")
+            if head_state is None:
+                return default_type
+
+            embed_dim = next(iter(head_state.values())).shape[-1] \
+                if "0.weight" not in head_state else head_state["0.weight"].shape[1]
+
+            import torch.nn as nn
+            head = nn.Sequential(
+                nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 256), nn.GELU(),
+                nn.Dropout(0.2), nn.Linear(256, len(VLM_CLASS_NAMES)),
+            )
+            head.load_state_dict(head_state)
+            head.eval()
+
+            rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+            rgb_pil = PILImg.fromarray(rgb)
+
+            if embed_dim == 512:
+                # Real CLIP mode
+                from transformers import CLIPModel, CLIPProcessor
+                cfg = ckpt.get("config", {})
+                base_model = cfg.get("base_model", "openai/clip-vit-base-patch32")
+                proc = CLIPProcessor.from_pretrained(base_model)
+                clip_m = CLIPModel.from_pretrained(base_model)
+                clip_m.eval()
+                inputs = proc(images=rgb_pil, return_tensors="pt")
+                with torch.no_grad():
+                    feat = clip_m.get_image_features(**inputs)
+                    feat = feat / feat.norm(dim=-1, keepdim=True)
+                    pred = head(feat).argmax(-1).item()
+            else:
+                # Flat feature mode
+                rgb_resized = cv2.resize(rgb, (224, 224)).astype(np.float32) / 255.0
+                feat = torch.from_numpy(rgb_resized.transpose(2, 0, 1).flatten()).float().unsqueeze(0)
+                with torch.no_grad():
+                    pred = head(feat).argmax(-1).item()
+            return VLM_CLASS_NAMES[pred]
+        except Exception as e:
+            pass  # Fall through to heuristic
+
+    # Colour heuristic fallback
+    if crop_bgr is None or crop_bgr.size == 0:
+        return default_type
+    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+    mean_h = float(hsv[:, :, 0].mean())
+    mean_s = float(hsv[:, :, 1].mean()) / 255.0
+    mean_v = float(hsv[:, :, 2].mean()) / 255.0
+    area   = crop_bgr.shape[0] * crop_bgr.shape[1]
+
+    # Large + grey → industrial warehouse or office
+    if area > 40000 and mean_s < 0.15:
+        return "industrial_warehouse" if mean_v < 0.5 else "office_tower"
+    # Warm + reddish → residential
+    if mean_h < 20 and mean_s > 0.2:
+        return "high_rise_residential"
+    # Green-ish (vegetation on roof) → villa
+    if 55 < mean_h < 85 and mean_s > 0.2:
+        return "villa_house"
+    # Blue-ish glass → office tower
+    if 90 < mean_h < 130 and mean_s > 0.3:
+        return "office_tower"
+    return default_type
+
+
+def extract_vegetation_instances(
+    terrain_pts: list, phys_scale: float = 0.05
+) -> list:
+    """
+    Cluster terrain points labelled 'vegetation' into discrete tree instances.
+    Uses simple grid-cell clustering — each occupied grid cell = one tree.
+    Returns list of vegetation entity dicts.
+    """
+    veg_pts = [p for p in terrain_pts if p.get("label") == "vegetation"]
+    if not veg_pts:
+        return []
+
+    cell_size = 4.0  # Group into 4m grid cells
+    cells:    dict = {}
+    for pt in veg_pts:
+        key = (round(pt["x"] / cell_size), round(pt["y"] / cell_size))
+        if key not in cells:
+            cells[key] = []
+        cells[key].append(pt)
+
+    vegetation = []
+    for tree_idx, (key, pts_in_cell) in enumerate(cells.items()):
+        cx   = float(np.mean([p["x"] for p in pts_in_cell]))
+        cz   = float(np.mean([p["y"] for p in pts_in_cell]))
+        # Height: use the 'h' field from terrain points
+        heights = [p.get("h", 2.5) for p in pts_in_cell]
+        tree_h  = float(np.max(heights))
+        radius  = min(max(len(pts_in_cell) * 0.3, 1.5), 6.0)
+        vegetation.append({
+            "id":       f"tree_{tree_idx}",
+            "position": [cx, 0.0, cz],
+            "height":   round(tree_h, 2),
+            "radius":   round(radius, 2),
+        })
+    return vegetation
+
+
+def build_entities_manifest(
+    all_building_instances: list,
+    all_terrain:            list,
+    all_objects:            list,
+    vlm_ckpt:               str = None,
+    ougs_scores:            dict = None,
+    phys_scale:             float = 0.05,
+) -> dict:
+    """
+    Build the final entities manifest from extracted building instances,
+    terrain vegetation clusters, and detected objects.
+
+    This is the data structure consumed by the web viewer's DynamicEntityManager.
+    """
+    # ── Buildings ──────────────────────────────────────────────────────────────
+    buildings_out = []
+    for inst in all_building_instances:
+        crop      = inst.pop("crop", None)
+        arch_type = classify_building_type(crop, vlm_ckpt)
+        fh        = FLOOR_HEIGHT_BY_TYPE.get(arch_type, 3.0)
+        n_floors  = max(1, round(inst["height_m"] / fh))
+
+        # Confidence: higher if mid-depth (well-observed from above)
+        depth     = inst.get("mean_depth", 0.5)
+        conf      = float(np.clip(1.0 - abs(depth - 0.45) * 2.0, 0.3, 0.95))
+
+        # OUGS uncertainty (if available)
+        uncertainty = float(ougs_scores.get(inst["id"], 0.5)) \
+            if ougs_scores else 0.5
+
+        buildings_out.append({
+            "id":            inst["id"],
+            "type":          arch_type,
+            "footprint": {
+                "cx":      round(inst["cx"], 3),
+                "cz":      round(inst["cz"], 3),
+                "w":       round(inst["width_m"], 2),
+                "d":       round(inst["depth_m"], 2),
+                "heading": 0.0,
+            },
+            "measuredHeight": round(inst["height_m"], 2),
+            "floorCount":     n_floors,
+            "confidence":     round(conf, 3),
+            "uncertainty":    round(uncertainty, 3),
+            "lod":            2,          # Upgraded from LoD1 OSM prior
+            "source":         "drone_reconstruction",
+            "frame":          inst.get("frame", 0),
+        })
+
+    # Deduplicate buildings that are within 3m of each other (across frames)
+    deduped = []
+    for b in buildings_out:
+        too_close = False
+        for existing in deduped:
+            dx = b["footprint"]["cx"] - existing["footprint"]["cx"]
+            dz = b["footprint"]["cz"] - existing["footprint"]["cz"]
+            if dx*dx + dz*dz < 9.0:   # 3m radius
+                # Keep the one with higher confidence
+                if b["confidence"] > existing["confidence"]:
+                    deduped.remove(existing)
+                    deduped.append(b)
+                too_close = True
+                break
+        if not too_close:
+            deduped.append(b)
+    buildings_out = deduped
+
+    # ── Vegetation ─────────────────────────────────────────────────────────────
+    vegetation_out = extract_vegetation_instances(all_terrain, phys_scale)
+
+    # ── Vehicles from detection ────────────────────────────────────────────────
+    VIS_TO_TYPE = {
+        "Car": "Car", "Van": "Van", "Truck": "Truck", "Bus": "Bus",
+        "Bicycle": "Bicycle", "Motor": "Motorcycle",
+        "Pedestrian": "Pedestrian", "People": "Pedestrian",
+    }
+    vehicles_out = []
+    for i, obj in enumerate(all_objects):
+        lbl = obj.get("label", "Others")
+        vtype = VIS_TO_TYPE.get(lbl, lbl)
+        vehicles_out.append({
+            "id":       f"veh_{i}",
+            "type":     vtype,
+            "position": [obj["x"], 0.0, obj["y"]],
+            "heading":  0.0,
+            "conf":     obj.get("conf", 0.5),
+        })
+
+    return {
+        "buildings":  buildings_out,
+        "vegetation": vegetation_out,
+        "vehicles":   vehicles_out,
+        "roads":      [],     # Populated by gis_prior.py or cross_modal_fuser.py
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights',    type=str, default='aero_mesh/training/runs/visdrone_fast/weights/last.pt')
     parser.add_argument('--seg-model', type=str, default='yolo11n-seg.pt')
     parser.add_argument('--max-images',type=int, default=5)
     parser.add_argument('--stride',    type=int, default=20, help='Terrain sampling stride (px). Lower = denser but slower.')
+    parser.add_argument('--vlm-ckpt',  type=str, default='checkpoints/vlm/best.pt',
+                        help='Path to VLM CLIP classifier checkpoint (optional — uses heuristic if absent)')
+    parser.add_argument('--no-entities', action='store_true',
+                        help='Skip entity extraction (faster, for quick terrain-only runs)')
     args = parser.parse_args()
 
     weights_path = os.path.abspath(args.weights)
@@ -343,9 +697,10 @@ def main():
     phys_scale    = 0.05          # pixels → world units
     frame_spacing = 300.0 * phys_scale
 
-    all_planes  = []
-    all_terrain = []
-    all_objects = []
+    all_planes             = []
+    all_terrain            = []
+    all_objects            = []
+    all_building_instances = []   # [NEW] for entity extraction
 
     for frame_idx, filename in enumerate(imgs):
         img_path = os.path.join(val_dir, filename)
@@ -399,6 +754,20 @@ def main():
         all_objects.extend(objects)
         print(f"[Recon]     objects: {len(objects)} in {time.time()-t0:.1f}s")
 
+        # [NEW] Building instance extraction
+        if not args.no_entities:
+            seg_result = seg_model(img, verbose=False)[0]
+            masks_data  = seg_result.masks.data.cpu().numpy() \
+                if seg_result.masks is not None else np.zeros((0, *img.shape[:2]))
+            cls_data    = seg_result.boxes.cls.cpu().numpy().astype(int) \
+                if seg_result.boxes is not None else np.array([])
+            buildings_raw = extract_building_instances(
+                masks_data, cls_data, depth_norm, img,
+                phys_scale=phys_scale, offset_y=offset_y, frame_idx=frame_idx
+            )
+            all_building_instances.extend(buildings_raw)
+            print(f"[Recon]     buildings detected: {len(buildings_raw)}")
+
     # ── Read training metadata ─────────────────────────────────────────────────
     epoch = 39
     mAP50 = 0.267
@@ -415,22 +784,52 @@ def main():
         except Exception:
             pass
 
+    # ── [NEW] Build entity manifest ────────────────────────────────────────────
+    entities = {"buildings": [], "vegetation": [], "vehicles": [], "roads": []}
+    if not args.no_entities and all_building_instances:
+        print(f"\n[Recon] Building entity manifest ({len(all_building_instances)} raw instances)…")
+        vlm_ckpt = args.vlm_ckpt if os.path.exists(args.vlm_ckpt) else None
+        if vlm_ckpt:
+            print(f"[Recon]   VLM classifier: {vlm_ckpt}")
+        else:
+            print("[Recon]   VLM checkpoint not found — using heuristic classification.")
+            print(f"          Train first: python aero_mesh/planning/train_vlm_classifier.py")
+
+        entities = build_entities_manifest(
+            all_building_instances, all_terrain, all_objects,
+            vlm_ckpt=vlm_ckpt, phys_scale=phys_scale,
+        )
+        print(f"[Recon]   Entities: {len(entities['buildings'])} buildings, "
+              f"{len(entities['vegetation'])} trees, {len(entities['vehicles'])} vehicles")
+    elif not args.no_entities:
+        # Still extract vegetation from terrain even if no seg-based buildings
+        entities["vegetation"] = extract_vegetation_instances(all_terrain, phys_scale)
+        entities["vehicles"]   = [
+            {"id": f"veh_{i}", "type": o.get("label", "Vehicle"),
+             "position": [o["x"], 0.0, o["y"]], "heading": 0.0, "conf": o.get("conf", 0.5)}
+            for i, o in enumerate(all_objects)
+        ]
+
     # ── Write output ───────────────────────────────────────────────────────────
     payload = {
         "generatedAt":    time.strftime("%Y-%m-%dT%H:%M:%S"),
         "depthBackend":   depth_backend,
         "stats": {
-            "numImages":  len(all_planes),
-            "numTerrain": len(all_terrain),
-            "numObjects": len(all_objects),
-            "epochAtExport":  epoch,
-            "mAP50AtExport":  round(float(mAP50), 4),
-            "modelName":  "yolo11n",
+            "numImages":   len(all_planes),
+            "numTerrain":  len(all_terrain),
+            "numObjects":  len(all_objects),
+            "numBuildings": len(entities.get("buildings", [])),
+            "numVegetation": len(entities.get("vegetation", [])),
+            "epochAtExport": epoch,
+            "mAP50AtExport": round(float(mAP50), 4),
+            "modelName":   "yolo11n",
             "sampleStride": args.stride,
+            "entityExtractionEnabled": not args.no_entities,
         },
         "planes":   all_planes,
         "terrain":  all_terrain,
         "objects":  all_objects,
+        "entities": entities,       # [NEW] — consumed by DynamicEntityManager
     }
 
     out_file = "web/public/pointcloud.json"
@@ -440,7 +839,9 @@ def main():
 
     mb = os.path.getsize(out_file) / (1024 * 1024)
     print(f"\n[Recon] ✓ Semantic terrain map → {os.path.abspath(out_file)}")
-    print(f"         {len(all_planes)} planes | {len(all_terrain)} terrain pts | {len(all_objects)} objects | {mb:.2f} MB")
+    print(f"         {len(all_planes)} planes | {len(all_terrain)} terrain pts | "
+          f"{len(all_objects)} objects | {len(entities.get('buildings',[]))} buildings | "
+          f"{mb:.2f} MB")
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ import { Play, Pause, SkipForward, SkipBack, Crosshair, Navigation } from 'lucid
 import { Canvas, useFrame, useThree, useLoader } from '@react-three/fiber';
 import { OrbitControls, PerspectiveCamera, useGLTF, useFBX, Splat, Clone } from '@react-three/drei';
 import * as THREE from 'three';
+import { DynamicEntityManager } from './DynamicEntityManager';
 
 interface MeshViewerProps {
   viewMode: 'rgb' | 'heatmap' | 'source';
@@ -20,9 +21,9 @@ interface TrajectoryPoint {
   vx: number; // 0-100 percentage of image width
   vy: number; // 0-100 percentage of image height
 }
-interface FrameEntry  { filename: string; frameOffset: number; }
-interface Sequence    { seqId: string; frameCount: number; frames: FrameEntry[]; trajectoryPoints: TrajectoryPoint[]; }
-interface FlightPlan  { generatedAt: string; totalImages: number; sequences: Sequence[]; originLatLon: [number, number]; }
+interface FrameEntry { filename: string; frameOffset: number; }
+interface Sequence { seqId: string; frameCount: number; frames: FrameEntry[]; trajectoryPoints: TrajectoryPoint[]; }
+interface FlightPlan { generatedAt: string; totalImages: number; sequences: Sequence[]; originLatLon: [number, number]; }
 
 // ── pointcloud.json types (semantic terrain schema) ─────────────────────────
 interface MeshPlane {
@@ -54,11 +55,12 @@ interface PointCloud {
     modelName: string;
     sampleStride: number;
   };
-  planes:   MeshPlane[];
-  terrain:  TerrainPt[];
-  objects:  ObjectMarker[];
+  planes: MeshPlane[];
+  terrain: TerrainPt[];
+  objects: ObjectMarker[];
+  entities?: any;
   // Legacy support (old schema fallback)
-  boxes?:   any[];
+  boxes?: any[];
 }
 
 // ── VisDrone annotation categories ───────────────────────────────────────────
@@ -83,22 +85,24 @@ function parseAnnotation(txt: string): BBox[] {
     if (parts.length < 6) return [];
     const [left, top, width, height, , category] = parts;
     if (category === 0 || !CATEGORY_LABELS[category]) return [];
-    return [{ x: left, y: top, w: width, h: height,
-              label: CATEGORY_LABELS[category],
-              color: CATEGORY_COLORS[category] ?? '#64748b' }];
+    return [{
+      x: left, y: top, w: width, h: height,
+      label: CATEGORY_LABELS[category],
+      color: CATEGORY_COLORS[category] ?? '#64748b'
+    }];
   });
 }
 
 // ── View filters ──────────────────────────────────────────────────────────────
 const VIEW_FILTER: Record<string, string> = {
   heatmap: 'saturate(0.35) brightness(0.65)',
-  rgb:     'saturate(1.15) brightness(1.05) contrast(1.02)',
-  source:  'grayscale(1) brightness(0.75) contrast(1.15)',
+  rgb: 'saturate(1.15) brightness(1.05) contrast(1.02)',
+  source: 'grayscale(1) brightness(0.75) contrast(1.15)',
 };
 const VIEW_TINT: Record<string, string> = {
   heatmap: 'rgba(14,165,233,0.15)',
-  rgb:     'transparent',
-  source:  'rgba(99,102,241,0.12)',
+  rgb: 'transparent',
+  source: 'rgba(99,102,241,0.12)',
 };
 
 // ── Rendered image rect accounting for object-contain letterboxing ────────────
@@ -150,7 +154,7 @@ function confToColor(conf: number): [number, number, number] {
 /** Source tag color: 1.0=MVS(cyan), ~0.6=mono(amber), ~0.2=3DGS(rose) */
 function sourceToColor(tag: number): [number, number, number] {
   if (tag >= 0.85) return [14, 165, 233];   // MVS – cyan
-  if (tag >= 0.5)  return [245, 158, 11];   // mono – amber
+  if (tag >= 0.5) return [245, 158, 11];   // mono – amber
   return [244, 63, 94];                      // 3DGS – rose
 }
 
@@ -163,21 +167,23 @@ interface PointCloudMeshProps {
   pointSize: number;
 }
 
-const TexturedPlane: React.FC<{ plane: MeshPlane; index: number }> = ({ plane }) => {
+const TexturedPlane: React.FC<{ plane: MeshPlane; index: number }> = ({ plane, index }) => {
   const texture = useLoader(THREE.TextureLoader, `/drone/${plane.filename}`);
   texture.colorSpace = THREE.SRGBColorSpace;
-  // Move plane to y=-0.3 so it sits BELOW all terrain geometry (which starts at y=0).
-  // polygonOffset pushes it further away from the camera to prevent Z-fighting.
+  // Stagger each overlapping plane by 2mm vertically based on frame index.
+  // This completely eliminates WebGL Z-fighting (flickering/glitching) on overlapping drone passes.
+  const yPos = -0.30 + (index * 0.003);
+
   return (
-    <mesh position={[plane.x, -0.3, plane.y]} rotation={[-Math.PI / 2, 0, 0]}>
+    <mesh position={[plane.x, yPos, plane.y]} rotation={[-Math.PI / 2, 0, 0]}>
       <planeGeometry args={[plane.w, plane.h]} />
       <meshBasicMaterial
         map={texture}
         side={THREE.DoubleSide}
         depthWrite={true}
         polygonOffset={true}
-        polygonOffsetFactor={2}
-        polygonOffsetUnits={2}
+        polygonOffsetFactor={-index}
+        polygonOffsetUnits={-index * 2}
       />
     </mesh>
   );
@@ -205,11 +211,14 @@ function terrainShape(pt: TerrainPt): THREE.BufferGeometry {
   }
 }
 
-// Object marker renderer: thin wireframe slabs for detected vehicles/people
-const ObjectMarkers: React.FC<{ objects: ObjectMarker[]; clipHeight: number }> = ({ objects, clipHeight }) => {
+// Object marker renderer: thin wireframe outlines for high-confidence detected vehicles
+const ObjectMarkers: React.FC<{ objects: ObjectMarker[]; clipHeight: number; viewMode?: string }> = ({ objects, clipHeight, viewMode = 'rgb' }) => {
+  const minConf = viewMode === 'heatmap' ? 0.45 : 0.65;
+  const filtered = objects.filter(o => o.h <= clipHeight && (o.conf ?? 1) >= minConf).slice(0, 120);
+
   return (
     <group>
-      {objects.filter(o => o.h <= clipHeight).map((obj, i) => {
+      {filtered.map((obj, i) => {
         let geom: THREE.BufferGeometry;
         if (obj.label === 'Pedestrian' || obj.label === 'People') {
           geom = new THREE.CapsuleGeometry(Math.max(obj.w, obj.d) / 2.5, obj.h / 2, 4, 8);
@@ -217,10 +226,9 @@ const ObjectMarkers: React.FC<{ objects: ObjectMarker[]; clipHeight: number }> =
           geom = new THREE.BoxGeometry(obj.w, obj.h, obj.d);
         }
         return (
-          <mesh key={`o-${i}`} position={[obj.x, obj.h / 2, obj.y]} geometry={geom}>
-            <meshBasicMaterial color={obj.color} transparent opacity={0.15} depthWrite={false} />
+          <mesh key={`o-${i}`} position={[obj.x, obj.h / 2 + 0.1, obj.y]} geometry={geom}>
             <lineSegments geometry={new THREE.EdgesGeometry(geom)}>
-              <lineBasicMaterial color={obj.color} linewidth={1} />
+              <lineBasicMaterial color={obj.color} linewidth={1} transparent opacity={0.6} />
             </lineSegments>
           </mesh>
         );
@@ -229,62 +237,22 @@ const ObjectMarkers: React.FC<{ objects: ObjectMarker[]; clipHeight: number }> =
   );
 };
 
-/**
- * DynamicBuildingOverlay — Procedurally instances the beautiful GLB building models
- * at the exact coordinates detected by the live AI (semantic terrain points).
- */
-const DynamicBuildingOverlay: React.FC<{ terrain: TerrainPt[] }> = ({ terrain }) => {
-  const { scene } = useGLTF('/api/assets/buildings.glb');
-  const bldgPts = terrain.filter(pt => pt.label === 'building');
-  
-  // Extract a single building mesh from the city GLB to use as an instance.
-  // In a real scenario we might map multiple meshes, but here we pick the first valid mesh.
-  const bldgMesh = useMemo(() => {
-    let mesh: THREE.Mesh | null = null;
-    scene.traverse((child) => {
-      if ((child as THREE.Mesh).isMesh && !mesh) {
-        mesh = child as THREE.Mesh;
-      }
-    });
-    return mesh || scene; // fallback to whole scene if no mesh found
-  }, [scene]);
+// Terrain renderer: renders subtle semantic overlay ONLY when heatmap shading is active
+const SemanticTerrain: React.FC<{ terrain: TerrainPt[]; clipHeight: number; viewMode?: string }> = ({ terrain, clipHeight, viewMode = 'rgb' }) => {
+  // If in realistic RGB mode, do NOT draw the heavy orange/blue blocks over the photo planes!
+  if (viewMode !== 'heatmap') return null;
 
-  if (!bldgMesh || bldgPts.length === 0) return null;
+  const filtered = terrain
+    .filter(pt => pt.h <= clipHeight && pt.label !== 'building' && pt.label !== 'vegetation')
+    .slice(0, 5000);
 
-  return (
-    <group>
-      {bldgPts.map((pt, i) => {
-        // Scale the mesh to match the detected building dimensions
-        const scaleX = 1.3 / 100; // approximate scale down from the large city mesh
-        const scaleY = pt.h / 100;
-        const scaleZ = 1.3 / 100;
-        return (
-          <Clone 
-            key={`bldg-${i}`} 
-            object={bldgMesh} 
-            scale={[scaleX, scaleY, scaleZ]} 
-            position={[pt.x, 0, pt.y]} 
-          />
-        );
-      })}
-    </group>
-  );
-};
-
-// Terrain renderer: renders roads and ground dynamically
-const SemanticTerrain: React.FC<{ terrain: TerrainPt[]; clipHeight: number }> = ({ terrain, clipHeight }) => {
-  // We only render non-building semantic points here because buildings and vegetation are handled by dynamic FBX overlays.
-  const filtered = terrain.filter(pt => pt.h <= clipHeight && pt.label !== 'building' && pt.label !== 'vegetation');
   return (
     <group>
       {filtered.map((pt, i) => {
-        const geom  = terrainShape(pt);
-        const color = pt.color;
-        const yPos  = pt.h / 2;
-        const opacity = pt.label === 'road' || pt.label === 'ground' ? 0.55 : 0.75;
+        const geom = new THREE.PlaneGeometry(1.25, 1.25);
         return (
-          <mesh key={`t-${i}`} position={[pt.x, yPos, pt.y]} geometry={geom}>
-            <meshBasicMaterial color={color} transparent opacity={opacity} depthWrite={false} />
+          <mesh key={`t-${i}`} position={[pt.x, 0.03, pt.y]} rotation={[-Math.PI / 2, 0, 0]} geometry={geom}>
+            <meshBasicMaterial color={pt.color} transparent opacity={0.28} depthWrite={false} />
           </mesh>
         );
       })}
@@ -359,21 +327,176 @@ const TreeOverlay: React.FC<{ terrain: TerrainPt[] }> = ({ terrain }) => {
   return (
     <group>
       {vegPts.map((pt, i) => (
-        <Clone 
-          key={`tree-${i}`} 
-          object={fbx} 
-          scale={[0.003, 0.003, 0.003]} 
-          position={[pt.x, 0, pt.y]} 
+        <Clone
+          key={`tree-${i}`}
+          object={fbx}
+          scale={[0.003, 0.003, 0.003]}
+          position={[pt.x, 0, pt.y]}
         />
       ))}
     </group>
   );
 };
 
-const ReconstructedMesh: React.FC<PointCloudMeshProps> = ({ cloud, clipHeight }) => {
+/**
+ * UAVFlightTrajectory3D
+ * Renders a glowing 3D flight corridor in the sky above the reconstructed 3D city:
+ * - Continuous 3D CatmullRom spline tube floating at 28-32m altitude
+ * - Waypoint spheres with vertical drop guidelines to each captured image plane
+ * - Animated drone with forward camera coverage frustum gliding along the path
+ */
+const UAVFlightTrajectory3D: React.FC<{ planes: MeshPlane[] }> = ({ planes }) => {
+  const droneRef = useRef<THREE.Group>(null);
+
+  // Generate 3D waypoints above each image plane along the flight corridor
+  const waypoints = useMemo(() => {
+    if (!planes || planes.length === 0) return [];
+    return planes.map((p, i) => {
+      // Gentle realistic survey path centered over the flight corridor
+      const swayX = Math.sin((i / Math.max(planes.length, 1)) * Math.PI * 2) * 4.0;
+      const altY = 28.0 + Math.sin(i * 0.5) * 2.0; // Suspended 28-30m in the air above buildings
+      return new THREE.Vector3(p.x + swayX, altY, p.y);
+    });
+  }, [planes]);
+
+  const curve = useMemo(() => {
+    if (waypoints.length < 2) return null;
+    return new THREE.CatmullRomCurve3(waypoints, false, 'catmullrom', 0.2);
+  }, [waypoints]);
+
+  const tubeGeometry = useMemo(() => {
+    if (!curve) return null;
+    return new THREE.TubeGeometry(curve, 80, 0.45, 8, false);
+  }, [curve]);
+
+  // Animate the drone along the 3D flight path
+  useFrame(({ clock }) => {
+    if (!curve || !droneRef.current) return;
+    const t = (clock.getElapsedTime() * 0.05) % 1;
+    const pos = curve.getPointAt(t);
+    const tangent = curve.getTangentAt(t);
+    droneRef.current.position.copy(pos);
+    droneRef.current.lookAt(pos.clone().add(tangent));
+  });
+
+  if (!curve || waypoints.length === 0) return null;
+
+  return (
+    <group>
+      {/* 1. Glowing 3D Flight Corridor Tube */}
+      {tubeGeometry && (
+        <mesh geometry={tubeGeometry}>
+          <meshStandardMaterial
+            color="#38bdf8"
+            emissive="#0ea5e9"
+            emissiveIntensity={1.8}
+            roughness={0.2}
+            metalness={0.7}
+            transparent
+            opacity={0.88}
+          />
+        </mesh>
+      )}
+
+      {/* 2. Waypoint spheres + vertical guide lines down to ground */}
+      {waypoints.map((wpt, i) => {
+        const lineGeom = new THREE.BufferGeometry().setFromPoints([
+          new THREE.Vector3(wpt.x, 0, wpt.z),
+          new THREE.Vector3(wpt.x, wpt.y, wpt.z),
+        ]);
+        return (
+          <group key={`wpt3d-${i}`}>
+            {/* Vertical laser drop line down to ground */}
+            <line geometry={lineGeom}>
+              <lineBasicMaterial color="#0284c7" transparent opacity={0.35} />
+            </line>
+
+            {/* Glowing Waypoint Sphere */}
+            <mesh position={[wpt.x, wpt.y, wpt.z]}>
+              <sphereGeometry args={[0.9, 16, 16]} />
+              <meshStandardMaterial
+                color="#38bdf8"
+                emissive="#38bdf8"
+                emissiveIntensity={2.2}
+              />
+            </mesh>
+
+            {/* Orbiting Halo Ring */}
+            <mesh position={[wpt.x, wpt.y, wpt.z]} rotation={[Math.PI / 2, 0, 0]}>
+              <ringGeometry args={[1.3, 1.7, 24]} />
+              <meshBasicMaterial
+                color="#0ea5e9"
+                transparent
+                opacity={0.7}
+                side={THREE.DoubleSide}
+              />
+            </mesh>
+          </group>
+        );
+      })}
+
+      {/* 3. Animated UAV Drone with Camera Coverage Frustum */}
+      <group ref={droneRef}>
+        {/* Drone Center Chassis */}
+        <mesh>
+          <boxGeometry args={[1.6, 0.4, 1.6]} />
+          <meshStandardMaterial color="#0f172a" metalness={0.9} roughness={0.2} />
+        </mesh>
+        <pointLight color="#38bdf8" intensity={4} distance={25} />
+
+        {/* Diagonal Arms */}
+        <mesh rotation={[0, Math.PI / 4, 0]}>
+          <boxGeometry args={[3.8, 0.15, 0.25]} />
+          <meshStandardMaterial color="#334155" />
+        </mesh>
+        <mesh rotation={[0, -Math.PI / 4, 0]}>
+          <boxGeometry args={[3.8, 0.15, 0.25]} />
+          <meshStandardMaterial color="#334155" />
+        </mesh>
+
+        {/* 4 Glowing Propellers */}
+        {[
+          [1.35, 0.25, 1.35],
+          [-1.35, 0.25, 1.35],
+          [1.35, 0.25, -1.35],
+          [-1.35, 0.25, -1.35],
+        ].map(([rx, ry, rz], idx) => (
+          <mesh key={idx} position={[rx, ry, rz]} rotation={[-Math.PI / 2, 0, 0]}>
+            <cylinderGeometry args={[0.75, 0.75, 0.04, 16]} />
+            <meshBasicMaterial color="#38bdf8" transparent opacity={0.6} />
+          </mesh>
+        ))}
+
+        {/* Downward Camera Sensor Frustum (Single-Pass Scanning Beam) */}
+        <group rotation={[Math.PI / 3.2, 0, 0]}>
+          <mesh position={[0, -12, 0]}>
+            <coneGeometry args={[9, 24, 4, 1, true]} />
+            <meshBasicMaterial
+              color="#38bdf8"
+              transparent
+              opacity={0.08}
+              wireframe
+              side={THREE.DoubleSide}
+            />
+          </mesh>
+        </group>
+      </group>
+    </group>
+  );
+};
+
+interface PointCloudMeshProps {
+  cloud: PointCloud;
+  viewMode: 'rgb' | 'heatmap' | 'source';
+  clipHeight: number;
+  pointSize: number;
+  showTrajectory?: boolean;
+}
+
+const ReconstructedMesh: React.FC<PointCloudMeshProps> = ({ cloud, viewMode, clipHeight, showTrajectory = true }) => {
   const groupRef = useRef<THREE.Group>(null);
-  const terrain  = cloud.terrain  ?? [];
-  const objects  = cloud.objects  ?? cloud.boxes ?? [];
+  const terrain = cloud.terrain ?? [];
+  const objects = cloud.objects ?? cloud.boxes ?? [];
 
   // Gentle auto-rotate
   useFrame((_, delta) => {
@@ -386,17 +509,29 @@ const ReconstructedMesh: React.FC<PointCloudMeshProps> = ({ cloud, clipHeight })
       {cloud.planes?.map((plane, i) => (
         <TexturedPlane key={i} plane={plane} index={i} />
       ))}
-      {/* Semantic terrain geometry (roads, ground) */}
-      <SemanticTerrain terrain={terrain} clipHeight={clipHeight} />
-      {/* Thin object markers */}
-      <ObjectMarkers objects={objects} clipHeight={clipHeight} />
-      {/* Dynamic 3D FBX overlays: buildings + trees */}
-      <Suspense fallback={null}>
-        <CityBuildingsOverlay planes={cloud.planes ?? []} />
-      </Suspense>
-      <Suspense fallback={null}>
-        <TreeOverlay terrain={terrain} />
-      </Suspense>
+      {/* Semantic terrain geometry: subtle overlay only in heatmap mode */}
+      <SemanticTerrain terrain={terrain} clipHeight={clipHeight} viewMode={viewMode} />
+      {/* Clean high-confidence object markers */}
+      <ObjectMarkers objects={objects} clipHeight={clipHeight} viewMode={viewMode} />
+      {/* Dynamic 3D Entities: Individual Buildings & Trees placed at AI-detected coordinates */}
+      {cloud.entities?.buildings && cloud.entities.buildings.length > 0 ? (
+        <Suspense fallback={null}>
+          <DynamicEntityManager entities={cloud.entities} clipHeight={clipHeight} />
+        </Suspense>
+      ) : (
+        <>
+          <Suspense fallback={null}>
+            <CityBuildingsOverlay planes={cloud.planes ?? []} />
+          </Suspense>
+          <Suspense fallback={null}>
+            <TreeOverlay terrain={terrain} />
+          </Suspense>
+        </>
+      )}
+      {/* 3D UAV Flight Trajectory Corridor in the sky */}
+      {showTrajectory && (
+        <UAVFlightTrajectory3D planes={cloud.planes ?? []} />
+      )}
     </group>
   );
 };
@@ -406,18 +541,21 @@ interface PointCloudViewerProps {
   viewMode: 'rgb' | 'heatmap' | 'source';
   clipHeight: number;
   pointSize: number;
+  showTrajectory?: boolean;
 }
 
-const PointCloudViewer: React.FC<PointCloudViewerProps> = ({ cloud, viewMode, clipHeight, pointSize }) => (
+const PointCloudViewer: React.FC<PointCloudViewerProps> = ({ cloud, viewMode, clipHeight, pointSize, showTrajectory = true }) => (
   <Canvas
     style={{ width: '100%', height: '100%', background: '#060b14' }}
     gl={{ antialias: true, alpha: true }}
   >
-    <PerspectiveCamera makeDefault position={[0, 80, 110]} fov={55} />
-    <ambientLight intensity={0.8} />
-    <directionalLight position={[50, 100, 50]} intensity={0.6} castShadow />
+    <PerspectiveCamera makeDefault position={[0, 95, 125]} fov={50} />
+    <ambientLight intensity={1.2} />
+    <directionalLight position={[70, 130, 70]} intensity={1.5} castShadow />
+    <directionalLight position={[-60, 90, -60]} intensity={0.5} />
+    <hemisphereLight args={['#38bdf8', '#0f172a', 0.65]} />
     <Suspense fallback={null}>
-      <ReconstructedMesh cloud={cloud} viewMode={viewMode} clipHeight={clipHeight} pointSize={pointSize} />
+      <ReconstructedMesh cloud={cloud} viewMode={viewMode} clipHeight={clipHeight} pointSize={pointSize} showTrajectory={showTrajectory} />
     </Suspense>
     <OrbitControls
       enableDamping
@@ -426,8 +564,8 @@ const PointCloudViewer: React.FC<PointCloudViewerProps> = ({ cloud, viewMode, cl
       maxDistance={500}
       makeDefault
     />
-      {/* Grid floor scaled to match scene — planes span 96 wide x 85 deep */}
-      <gridHelper args={[200, 40, '#0f2040', '#0d1a2e']} />
+    {/* Grid floor scaled to match scene — planes span 96 wide x 85 deep */}
+    <gridHelper args={[200, 40, '#0f2040', '#0d1a2e']} position={[0, -0.4, 0]} />
   </Canvas>
 );
 
@@ -446,7 +584,7 @@ const PointCloudPlaceholder: React.FC<{ epoch: number }> = ({ epoch }) => (
       display: 'flex', alignItems: 'center', justifyContent: 'center',
     }}>
       <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" strokeWidth="1.5">
-        <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+        <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" />
       </svg>
     </div>
     <div style={{ textAlign: 'center' }}>
@@ -473,9 +611,10 @@ interface Tier2ViewProps {
   viewMode: 'rgb' | 'heatmap' | 'source';
   clipHeight: number;
   pointSize: number;
+  showTrajectory?: boolean;
 }
 
-const Tier2View: React.FC<Tier2ViewProps> = ({ viewMode, clipHeight, pointSize }) => {
+const Tier2View: React.FC<Tier2ViewProps> = ({ viewMode, clipHeight, pointSize, showTrajectory = true }) => {
   const [cloud, setCloud] = useState<PointCloud | null>(null);
   const [epoch, setEpoch] = useState(0);
   const [showSplat, setShowSplat] = useState(false);
@@ -485,13 +624,13 @@ const Tier2View: React.FC<Tier2ViewProps> = ({ viewMode, clipHeight, pointSize }
     fetch('/training_status.json')
       .then(r => r.ok ? r.json() : null)
       .then(d => { if (d) setEpoch(d.epoch ?? 0); })
-      .catch(() => {});
+      .catch(() => { });
 
     // Load point cloud
     fetch('/pointcloud.json')
       .then(r => r.ok ? r.json() : null)
       .then((d: PointCloud | null) => { if (d) setCloud(d); })
-      .catch(() => {});
+      .catch(() => { });
   }, []);
 
   if (!cloud) return <PointCloudPlaceholder epoch={epoch} />;
@@ -509,7 +648,7 @@ const Tier2View: React.FC<Tier2ViewProps> = ({ viewMode, clipHeight, pointSize }
           <OrbitControls makeDefault />
         </Canvas>
       ) : (
-        <PointCloudViewer cloud={cloud} viewMode={viewMode} clipHeight={clipHeight} pointSize={pointSize} />
+        <PointCloudViewer cloud={cloud} viewMode={viewMode} clipHeight={clipHeight} pointSize={pointSize} showTrajectory={showTrajectory} />
       )}
 
       {/* View Toggle */}
@@ -550,12 +689,12 @@ const Tier2View: React.FC<Tier2ViewProps> = ({ viewMode, clipHeight, pointSize }
         display: 'flex', gap: 8, pointerEvents: 'none', flexWrap: 'wrap', justifyContent: 'center',
       }}>
         {[
-          { label: 'EPOCH',   value: String(cloud.stats?.epochAtExport ?? cloud.epochAtExport ?? '–') },
-          { label: 'mAP50',   value: `${((cloud.stats?.mAP50AtExport ?? cloud.mAP50AtExport ?? 0) * 100).toFixed(1)}%` },
+          { label: 'EPOCH', value: String(cloud.stats?.epochAtExport ?? cloud.epochAtExport ?? '–') },
+          { label: 'mAP50', value: `${((cloud.stats?.mAP50AtExport ?? cloud.mAP50AtExport ?? 0) * 100).toFixed(1)}%` },
           { label: 'TERRAIN', value: (cloud.stats?.numTerrain ?? cloud.terrain?.length ?? 0).toLocaleString() },
           { label: 'OBJECTS', value: (cloud.stats?.numObjects ?? cloud.objects?.length ?? 0).toLocaleString() },
-          { label: 'DEPTH',   value: (cloud.depthBackend ?? 'n/a').toUpperCase() },
-          { label: 'MODEL',   value: (cloud.stats?.modelName ?? cloud.modelName ?? 'YOLO').toUpperCase() },
+          { label: 'DEPTH', value: (cloud.depthBackend ?? 'n/a').toUpperCase() },
+          { label: 'MODEL', value: (cloud.stats?.modelName ?? cloud.modelName ?? 'YOLO').toUpperCase() },
         ].map(({ label, value }) => (
           <div key={label} style={{
             background: 'rgba(6,11,20,0.82)', backdropFilter: 'blur(8px)',
@@ -594,16 +733,16 @@ interface Tier1ViewProps {
 }
 
 const Tier1View: React.FC<Tier1ViewProps> = ({ viewMode, showTrajectory }) => {
-  const [plan, setPlan]               = useState<FlightPlan | null>(null);
-  const [seqIdx, setSeqIdx]           = useState(0);
-  const [frameIdx, setFrameIdx]       = useState(0);
-  const [imgLoaded, setImgLoaded]     = useState(false);
-  const [imgNat, setImgNat]           = useState({ w: 0, h: 0 });
-  const [boxes, setBoxes]             = useState<BBox[]>([]);
-  const [playing, setPlaying]         = useState(true);
+  const [plan, setPlan] = useState<FlightPlan | null>(null);
+  const [seqIdx, setSeqIdx] = useState(0);
+  const [frameIdx, setFrameIdx] = useState(0);
+  const [imgLoaded, setImgLoaded] = useState(false);
+  const [imgNat, setImgNat] = useState({ w: 0, h: 0 });
+  const [boxes, setBoxes] = useState<BBox[]>([]);
+  const [playing, setPlaying] = useState(true);
   const [containerSize, setContainerSize] = useState({ w: 0, h: 0 });
-  const containerRef  = useRef<HTMLDivElement>(null);
-  const intervalRef   = useRef<ReturnType<typeof setInterval> | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Measure container
   useEffect(() => {
@@ -625,8 +764,8 @@ const Tier1View: React.FC<Tier1ViewProps> = ({ viewMode, showTrajectory }) => {
       .catch(e => console.error('Failed to load flight plan:', e));
   }, []);
 
-  const currentSeq   = plan?.sequences[seqIdx] ?? null;
-  const totalFrames  = currentSeq?.frames.length ?? 0;
+  const currentSeq = plan?.sequences[seqIdx] ?? null;
+  const totalFrames = currentSeq?.frames.length ?? 0;
   const currentFrame = currentSeq?.frames[frameIdx] ?? null;
 
   // Load annotations
@@ -666,20 +805,20 @@ const Tier1View: React.FC<Tier1ViewProps> = ({ viewMode, showTrajectory }) => {
   }, [playing, advance]);
 
   // Trajectory
-  const trajectoryPts     = currentSeq?.trajectoryPoints ?? [];
+  const trajectoryPts = currentSeq?.trajectoryPoints ?? [];
   const activeWaypointIdx = trajectoryPts.length > 0
     ? Math.floor((frameIdx / Math.max(totalFrames - 1, 1)) * (trajectoryPts.length - 1))
     : 0;
   const activeWpt = trajectoryPts[activeWaypointIdx];
 
   // Viewport area (exclude 70px controls bar at bottom)
-  const viewH    = Math.max(1, containerSize.h - 70);
-  const viewW    = Math.max(1, containerSize.w);
+  const viewH = Math.max(1, containerSize.h - 70);
+  const viewW = Math.max(1, containerSize.w);
   const rendered = getRenderedRect(viewW, viewH, imgNat.w || viewW, imgNat.h || viewH);
 
   // RIGHT / BOTTOM bounds of the rendered image area (absolute in container)
-  const renderedRight  = rendered.left + rendered.w;
-  const renderedBottom = rendered.top  + rendered.h;
+  const renderedRight = rendered.left + rendered.w;
+  const renderedBottom = rendered.top + rendered.h;
 
   const imgUrl = currentFrame ? `/drone/${currentFrame.filename}` : null;
   const depthImgUrl = currentFrame ? `/drone/${currentFrame.filename.replace('.jpg', '_depth.jpg')}` : null;
@@ -752,19 +891,19 @@ const Tier1View: React.FC<Tier1ViewProps> = ({ viewMode, showTrajectory }) => {
       {imgLoaded && imgNat.w > 0 && boxes.slice(0, 14).map((box, i) => {
         // Convert annotation pixel coords → container-absolute pixels
         const rawLeft = rendered.left + (box.x / imgNat.w) * rendered.w;
-        const rawTop  = rendered.top  + (box.y / imgNat.h) * rendered.h;
-        const rawW    = (box.w / imgNat.w) * rendered.w;
-        const rawH    = (box.h / imgNat.h) * rendered.h;
+        const rawTop = rendered.top + (box.y / imgNat.h) * rendered.h;
+        const rawW = (box.w / imgNat.w) * rendered.w;
+        const rawH = (box.h / imgNat.h) * rendered.h;
 
         // Clamp left & top to stay inside rendered rect
         const left = Math.max(rendered.left, rawLeft);
-        const top  = Math.max(rendered.top,  rawTop);
+        const top = Math.max(rendered.top, rawTop);
 
         // Clamp right edge: box must not exceed rendered image right/bottom
-        const right  = Math.min(renderedRight,  rawLeft + Math.max(rawW, 6));
-        const bottom = Math.min(renderedBottom, rawTop  + Math.max(rawH, 6));
+        const right = Math.min(renderedRight, rawLeft + Math.max(rawW, 6));
+        const bottom = Math.min(renderedBottom, rawTop + Math.max(rawH, 6));
 
-        const w = right  - left;
+        const w = right - left;
         const h = bottom - top;
 
         // Skip degenerate boxes (completely outside image area)
@@ -785,9 +924,9 @@ const Tier1View: React.FC<Tier1ViewProps> = ({ viewMode, showTrajectory }) => {
             }}>{box.label}</div>
             {/* Corner ticks */}
             {[
-              { top: -1, left: -1,   borderTop: `2px solid ${box.color}`, borderLeft:   `2px solid ${box.color}` },
-              { top: -1, right: -1,  borderTop: `2px solid ${box.color}`, borderRight:  `2px solid ${box.color}` },
-              { bottom: -1, left: -1,  borderBottom: `2px solid ${box.color}`, borderLeft:  `2px solid ${box.color}` },
+              { top: -1, left: -1, borderTop: `2px solid ${box.color}`, borderLeft: `2px solid ${box.color}` },
+              { top: -1, right: -1, borderTop: `2px solid ${box.color}`, borderRight: `2px solid ${box.color}` },
+              { bottom: -1, left: -1, borderBottom: `2px solid ${box.color}`, borderLeft: `2px solid ${box.color}` },
               { bottom: -1, right: -1, borderBottom: `2px solid ${box.color}`, borderRight: `2px solid ${box.color}` },
             ].map((s, j) => (
               <div key={j} style={{ position: 'absolute', width: 6, height: 6, ...s }} />
@@ -809,43 +948,73 @@ const Tier1View: React.FC<Tier1ViewProps> = ({ viewMode, showTrajectory }) => {
         >
           <defs>
             <filter id="glow">
-              <feGaussianBlur stdDeviation="2.5" result="coloredBlur"/>
-              <feMerge><feMergeNode in="coloredBlur"/><feMergeNode in="SourceGraphic"/></feMerge>
+              <feGaussianBlur stdDeviation="2.5" result="coloredBlur" />
+              <feMerge><feMergeNode in="coloredBlur" /><feMergeNode in="SourceGraphic" /></feMerge>
             </filter>
           </defs>
 
-          {/* Path polyline */}
-          <polyline
-            points={trajectoryPts.map(p =>
-              `${(p.vx / 100) * rendered.w},${(p.vy / 100) * rendered.h}`
-            ).join(' ')}
-            fill="none"
-            stroke="rgba(56,189,248,0.85)"
-            strokeWidth="3.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
+          {/* Perspective Flight Corridor Polyline */}
+          {(() => {
+            const corridorPoints = trajectoryPts.map((_, i) => {
+              const prog = i / Math.max(trajectoryPts.length - 1, 1);
+              // Naturally follows the road center corridor from horizon (top center) to foreground (bottom center)
+              const px = rendered.w * (0.50 + Math.sin(prog * Math.PI * 1.2) * 0.06);
+              const py = rendered.h * (0.16 + prog * 0.72);
+              return { x: px, y: py, i };
+            });
 
-          {/* Waypoint dots */}
-          {trajectoryPts.map((p, i) => (
-            <circle
-              key={i}
-              cx={(p.vx / 100) * rendered.w}
-              cy={(p.vy / 100) * rendered.h}
-              r={i === activeWaypointIdx ? 5 : 2.5}
-              fill={i === activeWaypointIdx ? '#38bdf8' : 'rgba(56,189,248,0.5)'}
-              filter={i === activeWaypointIdx ? 'url(#glow)' : undefined}
-            />
-          ))}
+            return (
+              <>
+                {/* Glowing flight corridor center-line */}
+                <polyline
+                  points={corridorPoints.map(p => `${p.x},${p.y}`).join(' ')}
+                  fill="none"
+                  stroke="rgba(56,189,248,0.85)"
+                  strokeWidth="3.0"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  filter="url(#glow)"
+                />
 
-          {/* Active UAV ring */}
-          {activeWpt && (
-            <circle
-              cx={(activeWpt.vx / 100) * rendered.w}
-              cy={(activeWpt.vy / 100) * rendered.h}
-              r={13} fill="none" stroke="#38bdf8" strokeWidth="1.5" opacity="0.4"
-            />
-          )}
+                {/* Waypoint dots */}
+                {corridorPoints.map(p => (
+                  <circle
+                    key={p.i}
+                    cx={p.x}
+                    cy={p.y}
+                    r={p.i === activeWaypointIdx ? 6 : 2.5}
+                    fill={p.i === activeWaypointIdx ? '#38bdf8' : 'rgba(56,189,248,0.6)'}
+                    filter={p.i === activeWaypointIdx ? 'url(#glow)' : undefined}
+                  />
+                ))}
+
+                {/* Active UAV position reticle */}
+                {corridorPoints[activeWaypointIdx] && (
+                  <g>
+                    <circle
+                      cx={corridorPoints[activeWaypointIdx].x}
+                      cy={corridorPoints[activeWaypointIdx].y}
+                      r={14}
+                      fill="none"
+                      stroke="#38bdf8"
+                      strokeWidth="1.5"
+                      opacity="0.6"
+                    />
+                    <circle
+                      cx={corridorPoints[activeWaypointIdx].x}
+                      cy={corridorPoints[activeWaypointIdx].y}
+                      r={22}
+                      fill="none"
+                      stroke="#38bdf8"
+                      strokeWidth="1.0"
+                      strokeDasharray="3 3"
+                      opacity="0.4"
+                    />
+                  </g>
+                )}
+              </>
+            );
+          })()}
         </svg>
       )}
 
@@ -854,9 +1023,9 @@ const Tier1View: React.FC<Tier1ViewProps> = ({ viewMode, showTrajectory }) => {
 
       {/* Corner brackets */}
       {[
-        { top: 12, left: 12,   borderTop: '2px solid rgba(56,189,248,0.45)', borderLeft:   '2px solid rgba(56,189,248,0.45)', width: 20, height: 20 },
-        { top: 12, right: 12,  borderTop: '2px solid rgba(56,189,248,0.45)', borderRight:  '2px solid rgba(56,189,248,0.45)', width: 20, height: 20 },
-        { bottom: 82, left: 12,  borderBottom: '2px solid rgba(56,189,248,0.45)', borderLeft:  '2px solid rgba(56,189,248,0.45)', width: 20, height: 20 },
+        { top: 12, left: 12, borderTop: '2px solid rgba(56,189,248,0.45)', borderLeft: '2px solid rgba(56,189,248,0.45)', width: 20, height: 20 },
+        { top: 12, right: 12, borderTop: '2px solid rgba(56,189,248,0.45)', borderRight: '2px solid rgba(56,189,248,0.45)', width: 20, height: 20 },
+        { bottom: 82, left: 12, borderBottom: '2px solid rgba(56,189,248,0.45)', borderLeft: '2px solid rgba(56,189,248,0.45)', width: 20, height: 20 },
         { bottom: 82, right: 12, borderBottom: '2px solid rgba(56,189,248,0.45)', borderRight: '2px solid rgba(56,189,248,0.45)', width: 20, height: 20 },
       ].map((s, i) => <div key={i} style={{ position: 'absolute', pointerEvents: 'none', ...s }} />)}
 
@@ -871,11 +1040,11 @@ const Tier1View: React.FC<Tier1ViewProps> = ({ viewMode, showTrajectory }) => {
         display: 'flex', gap: 8, pointerEvents: 'none', flexWrap: 'wrap', justifyContent: 'center',
       }}>
         {[
-          { label: 'SEQ',   value: currentSeq?.seqId ?? '–' },
+          { label: 'SEQ', value: currentSeq?.seqId ?? '–' },
           { label: 'FRAME', value: totalFrames > 0 ? `${frameIdx + 1}/${totalFrames}` : '–' },
-          { label: 'ALT',   value: activeWpt ? `${activeWpt.alt.toFixed(1)}m` : '–' },
-          { label: 'LAT',   value: activeWpt ? activeWpt.lat.toFixed(5) : '–' },
-          { label: 'LON',   value: activeWpt ? activeWpt.lon.toFixed(5) : '–' },
+          { label: 'ALT', value: activeWpt ? `${activeWpt.alt.toFixed(1)}m` : '–' },
+          { label: 'LAT', value: activeWpt ? activeWpt.lat.toFixed(5) : '–' },
+          { label: 'LON', value: activeWpt ? activeWpt.lon.toFixed(5) : '–' },
         ].map(({ label, value }) => (
           <div key={label} style={{
             background: 'rgba(6,11,20,0.82)', backdropFilter: 'blur(8px)',
@@ -945,7 +1114,7 @@ const Tier1View: React.FC<Tier1ViewProps> = ({ viewMode, showTrajectory }) => {
 
         {/* Timeline + controls */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <button onClick={goBack}  style={btnStyle(false)}><SkipBack  size={12} /></button>
+          <button onClick={goBack} style={btnStyle(false)}><SkipBack size={12} /></button>
           <button onClick={() => setPlaying(p => !p)} style={btnStyle(playing)}>
             {playing ? <Pause size={12} /> : <Play size={12} />}
             <span style={{ fontSize: 10, fontWeight: 700 }}>{playing ? 'LIVE' : 'PAUSED'}</span>
@@ -989,7 +1158,7 @@ export const MeshViewer: React.FC<MeshViewerProps> = ({
   viewMode, tierMode, clipHeight, pointSize, showTrajectory,
 }) => {
   if (tierMode === 'tier2') {
-    return <Tier2View viewMode={viewMode} clipHeight={clipHeight} pointSize={pointSize} />;
+    return <Tier2View viewMode={viewMode} clipHeight={clipHeight} pointSize={pointSize} showTrajectory={showTrajectory} />;
   }
   return <Tier1View viewMode={viewMode} showTrajectory={showTrajectory} />;
 };

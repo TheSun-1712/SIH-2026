@@ -27,41 +27,70 @@ venv*/
 .env/
 env*/
 
-# Node/Frontend
+# Node / Frontend
 node_modules/
 dist/
 build/
 .npm/
 
-# IDEs
+# IDEs & OS
 .idea/
 .vscode/
 *.swp
 *.swo
-
-# Project Specific Data & Models
-VisDrone2019-*/
-yolo_visdrone/
-*.pt
-*.pth
-*.onnx
-runs/
-**/runs/
-results/
-dataset/
-aero_output/
-.pytest_cache/
-web/public/pointcloud.json
-web/public/flight_plan.json
-web/public/training_status.json
-
-# OS specific
 .DS_Store
 Thumbs.db
 .gemini/
+.agents/
 
-# Downloaded 3D assets & zip archives
+# Datasets (Large aerial/video datasets)
+VisDrone2019-*/
+yolo_visdrone/
+AID_dataset/
+dataset/
+**/dataset/
+
+# Weights & ML Checkpoints (Large binary model files)
+*.pt
+*.pth
+*.onnx
+*.ckpt
+checkpoints/
+**/checkpoints/
+weights/
+**/weights/
+runs/
+**/runs/
+results/
+aero_output/
+aero_mesh_output/
+*.jsonl
+
+# Large 3D Point Clouds, Splats & Reconstructions
+*.splat
+*.ply
+*.las
+*.laz
+*.pcd
+
+# Downloaded 3D archives & raw unpacks
 *.zip
+*.rar
+*.7z
+*.tar
+*.tar.gz
+*.gz
 free-london-skyscraper/
 full-gameready-city-buildings/
 mystical-x-tree-viii/
+
+# Generated Pipeline Runtime Outputs in Web
+web/public/pointcloud.json
+web/public/flight_plan.json
+web/public/flight_plan_planned.json
+web/public/training_status.json
+web/public/gis_entities.json
+web/public/drone/
+
+# Test caches
+.pytest_cache/

@@ -101,7 +101,7 @@ const DynamicBuildingInstance: React.FC<{
     }
   }, [building.measuredHeight, building.type]);
 
-  const { cloned, scale, position, foundationW, foundationD } = useMemo(() => {
+  const { cloned, scale, modelOffset, foundationW, foundationD } = useMemo(() => {
     // Clone scene and apply textures + materials
     const clonedScene = scene.clone(true);
     const accentHex = TYPE_ACCENT_COLORS[building.type] || '#38bdf8';
@@ -146,22 +146,18 @@ const DynamicBuildingInstance: React.FC<{
     return {
       cloned: clonedScene,
       scale: [sx, sy, sz] as [number, number, number],
-      position: [
-        building.footprint.cx - center.x * sx,
-        -box.min.y * sy,
-        building.footprint.cz - center.z * sz,
-      ] as [number, number, number],
+      modelOffset: [-center.x * sx, -box.min.y * sy, -center.z * sz] as [number, number, number],
       foundationW: targetW * 1.04,
       foundationD: targetD * 1.04,
     };
   }, [scene, building, actualHeight, colormap]);
 
   return (
-    <group position={position}>
-      {/* 3D Modular Building Mesh */}
-      <primitive object={cloned} scale={scale} />
+    <group position={[building.footprint.cx, 0, building.footprint.cz]}>
+      {/* 3D Modular Building Mesh centered over footprint */}
+      <primitive object={cloned} position={modelOffset} scale={scale} />
 
-      {/* Dark Slate Base Foundation (snaps building firmly into ground) */}
+      {/* Dark Slate Base Foundation firmly centered under building */}
       <mesh position={[0, 0.1, 0]}>
         <boxGeometry args={[foundationW, 0.2, foundationD]} />
         <meshStandardMaterial color="#1e293b" roughness={0.9} />

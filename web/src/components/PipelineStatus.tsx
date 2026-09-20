@@ -90,13 +90,10 @@ export const PipelineStatus: React.FC<PipelineStatusProps> = ({
   const [stages, setStages] = useState<Stage[]>(
     PIPELINE_STAGES.map(s => ({ ...s, status: 'pending' as const }))
   );
-  const [currentIdx, setCurrentIdx] = useState(-1);
   const [totalElapsed, setTotalElapsed] = useState(0);
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const loopRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const runPipeline = () => {
-    setCurrentIdx(-1);
     setTotalElapsed(0);
     setStages(PIPELINE_STAGES.map(s => ({ ...s, status: 'pending' as const })));
 
@@ -104,7 +101,6 @@ export const PipelineStatus: React.FC<PipelineStatusProps> = ({
     PIPELINE_STAGES.forEach((stage, i) => {
       // Start stage
       setTimeout(() => {
-        setCurrentIdx(i);
         setStages(prev => prev.map((s, idx) =>
           idx === i ? { ...s, status: 'running' } : s
         ));

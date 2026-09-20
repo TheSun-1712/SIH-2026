@@ -1,9 +1,23 @@
 import React, { useState, useEffect, useRef, useCallback, Suspense, useMemo } from 'react';
-import { Play, Pause, SkipForward, SkipBack, Crosshair, Navigation } from 'lucide-react';
+import {
+  Play, Pause, SkipForward, SkipBack, Crosshair, Navigation,
+  Video, RotateCcw
+} from 'lucide-react';
 import { Canvas, useFrame, useThree, useLoader } from '@react-three/fiber';
 import { OrbitControls, PerspectiveCamera, useGLTF, useFBX, Splat, Clone } from '@react-three/drei';
 import * as THREE from 'three';
 import { DynamicEntityManager } from './DynamicEntityManager';
+
+export interface MapBounds {
+  minX: number;
+  maxX: number;
+  minZ: number;
+  maxZ: number;
+  width: number;
+  depth: number;
+  centerX: number;
+  centerZ: number;
+}
 
 interface MeshViewerProps {
   viewMode: 'rgb' | 'heatmap' | 'source';
@@ -137,7 +151,7 @@ const ScanLine: React.FC = () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Converts confidence (0-1) to a heatmap RGB color (blue→cyan→green→yellow→red) */
-function confToColor(conf: number): [number, number, number] {
+export function confToColor(conf: number): [number, number, number] {
   const t = Math.max(0, Math.min(1, conf));
   if (t < 0.33) {
     const s = t / 0.33;
@@ -152,7 +166,7 @@ function confToColor(conf: number): [number, number, number] {
 }
 
 /** Source tag color: 1.0=MVS(cyan), ~0.6=mono(amber), ~0.2=3DGS(rose) */
-function sourceToColor(tag: number): [number, number, number] {
+export function sourceToColor(tag: number): [number, number, number] {
   if (tag >= 0.85) return [14, 165, 233];   // MVS – cyan
   if (tag >= 0.5) return [245, 158, 11];   // mono – amber
   return [244, 63, 94];                      // 3DGS – rose
@@ -191,7 +205,7 @@ const TexturedPlane: React.FC<{ plane: MeshPlane; index: number }> = ({ plane, i
 
 // ── Terrain label → geometry type ────────────────────────────────────────────
 
-function terrainShape(pt: TerrainPt): THREE.BufferGeometry {
+export function terrainShape(pt: TerrainPt): THREE.BufferGeometry {
   // Use a consistent footprint that covers the sampling stride area.
   // stride=25px * phys_scale(0.05) = 1.25 world units per sample.
   // Make each tile slightly larger (1.3) so there are no gaps between tiles.
@@ -407,6 +421,7 @@ const UAVFlightTrajectory3D: React.FC<{ planes: MeshPlane[] }> = ({ planes }) =>
         return (
           <group key={`wpt3d-${i}`}>
             {/* Vertical laser drop line down to ground */}
+            {/* @ts-ignore */}
             <line geometry={lineGeom}>
               <lineBasicMaterial color="#0284c7" transparent opacity={0.35} />
             </line>
@@ -494,17 +509,11 @@ interface PointCloudMeshProps {
 }
 
 const ReconstructedMesh: React.FC<PointCloudMeshProps> = ({ cloud, viewMode, clipHeight, showTrajectory = true }) => {
-  const groupRef = useRef<THREE.Group>(null);
   const terrain = cloud.terrain ?? [];
   const objects = cloud.objects ?? cloud.boxes ?? [];
 
-  // Gentle auto-rotate
-  useFrame((_, delta) => {
-    if (groupRef.current) groupRef.current.rotation.y += delta * 0.025;
-  });
-
   return (
-    <group ref={groupRef}>
+    <group>
       {/* Ground-truth image planes */}
       {cloud.planes?.map((plane, i) => (
         <TexturedPlane key={i} plane={plane} index={i} />
@@ -542,14 +551,325 @@ interface PointCloudViewerProps {
   clipHeight: number;
   pointSize: number;
   showTrajectory?: boolean;
+  navMode: 'auto' | 'follow';
+  mapBounds: MapBounds;
+  resetKey: number;
+  onZoneChange: (zone: 'glide' | 'rotate') => void;
+  onManualTakeover: () => void;
 }
 
-const PointCloudViewer: React.FC<PointCloudViewerProps> = ({ cloud, viewMode, clipHeight, pointSize, showTrajectory = true }) => (
+/**
+ * MapBoundaryVisual
+ * Clearly defines the physical boundaries of the drone survey area:
+ * - Glowing neon ground perimeter loop
+ * - Holographic semi-transparent boundary barrier walls (3.2m tall) with illuminated top rail
+ * - 4 Corner beacon towers with pulsating light caps
+ */
+const MapBoundaryVisual: React.FC<{ bounds: MapBounds }> = ({ bounds }) => {
+  const { minX, maxX, minZ, maxZ, width, depth, centerX, centerZ } = bounds;
+
+  const loopPoints = useMemo(() => [
+    new THREE.Vector3(minX, 0.08, minZ),
+    new THREE.Vector3(maxX, 0.08, minZ),
+    new THREE.Vector3(maxX, 0.08, maxZ),
+    new THREE.Vector3(minX, 0.08, maxZ),
+  ], [minX, maxX, minZ, maxZ]);
+
+  const loopGeometry = useMemo(() => {
+    return new THREE.BufferGeometry().setFromPoints([...loopPoints, loopPoints[0]]);
+  }, [loopPoints]);
+
+  const wallHeight = 3.2;
+
+  const topRailGeometry = useMemo(() => {
+    return new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(minX, wallHeight, minZ),
+      new THREE.Vector3(maxX, wallHeight, minZ),
+      new THREE.Vector3(maxX, wallHeight, maxZ),
+      new THREE.Vector3(minX, wallHeight, maxZ),
+      new THREE.Vector3(minX, wallHeight, minZ),
+    ]);
+  }, [minX, maxX, minZ, maxZ, wallHeight]);
+
+  const cornerPosts = useMemo(() => [
+    [minX, minZ],
+    [maxX, minZ],
+    [maxX, maxZ],
+    [minX, maxZ],
+  ], [minX, maxX, minZ, maxZ]);
+
+  return (
+    <group>
+      {/* 1. Glowing ground perimeter line */}
+      {/* @ts-ignore */}
+      <line geometry={loopGeometry}>
+        <lineBasicMaterial color="#38bdf8" linewidth={2} transparent opacity={0.9} />
+      </line>
+
+      {/* 2. Top rail line of the boundary fence */}
+      {/* @ts-ignore */}
+      <line geometry={topRailGeometry}>
+        <lineBasicMaterial color="#0ea5e9" linewidth={2} transparent opacity={0.7} />
+      </line>
+
+      {/* 3. Holographic Semi-transparent Boundary Walls */}
+      {/* North wall */}
+      <mesh position={[centerX, wallHeight / 2, minZ]}>
+        <planeGeometry args={[width, wallHeight]} />
+        <meshBasicMaterial color="#38bdf8" transparent opacity={0.08} side={THREE.DoubleSide} depthWrite={false} />
+      </mesh>
+      {/* South wall */}
+      <mesh position={[centerX, wallHeight / 2, maxZ]}>
+        <planeGeometry args={[width, wallHeight]} />
+        <meshBasicMaterial color="#38bdf8" transparent opacity={0.08} side={THREE.DoubleSide} depthWrite={false} />
+      </mesh>
+      {/* West wall */}
+      <mesh position={[minX, wallHeight / 2, centerZ]} rotation={[0, Math.PI / 2, 0]}>
+        <planeGeometry args={[depth, wallHeight]} />
+        <meshBasicMaterial color="#38bdf8" transparent opacity={0.08} side={THREE.DoubleSide} depthWrite={false} />
+      </mesh>
+      {/* East wall */}
+      <mesh position={[maxX, wallHeight / 2, centerZ]} rotation={[0, Math.PI / 2, 0]}>
+        <planeGeometry args={[depth, wallHeight]} />
+        <meshBasicMaterial color="#38bdf8" transparent opacity={0.08} side={THREE.DoubleSide} depthWrite={false} />
+      </mesh>
+
+      {/* 4. Glowing Corner Beacon Pillars */}
+      {cornerPosts.map(([cx, cz], i) => (
+        <group key={`corner-beacon-${i}`} position={[cx, 0, cz]}>
+          <mesh position={[0, wallHeight / 2, 0]}>
+            <cylinderGeometry args={[0.22, 0.22, wallHeight, 12]} />
+            <meshStandardMaterial color="#0369a1" emissive="#0284c7" emissiveIntensity={0.6} />
+          </mesh>
+          <mesh position={[0, wallHeight + 0.35, 0]}>
+            <sphereGeometry args={[0.42, 16, 16]} />
+            <meshStandardMaterial color="#38bdf8" emissive="#38bdf8" emissiveIntensity={2.8} />
+          </mesh>
+          <mesh position={[0, 0.09, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+            <ringGeometry args={[0.5, 1.8, 16]} />
+            <meshBasicMaterial color="#38bdf8" transparent opacity={0.4} side={THREE.DoubleSide} />
+          </mesh>
+        </group>
+      ))}
+    </group>
+  );
+};
+
+/**
+ * CameraNavigationManager
+ * Boundary-Aware Camera Controller:
+ * - Mouse INSIDE map boundary: Left-click drag GLIDES throughout the map forward/backward/left/right
+ * - Mouse OUTSIDE map boundary: Left-click drag ROTATES the entire map 360° in any direction
+ * - Scroll wheel zooms smoothly anywhere
+ * - Keyboard WASD / Arrow keys glide smoothly
+ * - Follow Drone Mode: third-person chase camera locking onto the animated UAV drone
+ */
+const CameraNavigationManager: React.FC<{
+  navMode: 'auto' | 'follow';
+  planes?: MeshPlane[];
+  mapBounds: MapBounds;
+  resetKey: number;
+  onZoneChange?: (zone: 'glide' | 'rotate') => void;
+  onManualTakeover?: () => void;
+}> = ({ navMode, planes, mapBounds, resetKey, onZoneChange, onManualTakeover }) => {
+  const { camera, gl } = useThree();
+  const controlsRef = useRef<any>(null);
+  const keysPressed = useRef<{ [key: string]: boolean }>({});
+
+  // Set initial camera view and handle reset
+  useEffect(() => {
+    if (controlsRef.current) {
+      camera.position.set(0, 52, -38);
+      if (controlsRef.current.target) {
+        controlsRef.current.target.set(0, 8, 55);
+      }
+      controlsRef.current.update();
+    }
+  }, [resetKey, camera]);
+
+  // Raycasting boundary interaction listener on domElement
+  useEffect(() => {
+    const domElement = gl.domElement;
+    if (!domElement) return;
+
+    const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+    const raycaster = new THREE.Raycaster();
+    const intersection = new THREE.Vector3();
+
+    const isInsideBounds = (clientX: number, clientY: number): boolean => {
+      const rect = domElement.getBoundingClientRect();
+      const x = ((clientX - rect.left) / rect.width) * 2 - 1;
+      const y = -((clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(new THREE.Vector2(x, y), camera);
+      const hits = raycaster.ray.intersectPlane(groundPlane, intersection);
+      if (!hits) return false;
+
+      return (
+        intersection.x >= mapBounds.minX &&
+        intersection.x <= mapBounds.maxX &&
+        intersection.z >= mapBounds.minZ &&
+        intersection.z <= mapBounds.maxZ
+      );
+    };
+
+    const handlePointerDown = (e: PointerEvent) => {
+      if (e.button !== 0 || !controlsRef.current) return;
+      if (navMode === 'follow') {
+        onManualTakeover?.();
+      }
+
+      const inside = isInsideBounds(e.clientX, e.clientY);
+      onZoneChange?.(inside ? 'glide' : 'rotate');
+
+      if (inside) {
+        // INSIDE MAP BOUNDARY -> GLIDE / PAN FORWARD & ACROSS TERRAIN
+        controlsRef.current.mouseButtons.LEFT = THREE.MOUSE.PAN;
+        controlsRef.current.screenSpacePanning = false;
+        controlsRef.current.panSpeed = 1.4;
+      } else {
+        // OUTSIDE MAP BOUNDARY -> ROTATE THE ENTIRE MAP 360° IN ANY DIRECTION
+        controlsRef.current.mouseButtons.LEFT = THREE.MOUSE.ROTATE;
+        controlsRef.current.screenSpacePanning = false;
+        controlsRef.current.rotateSpeed = 1.0;
+      }
+    };
+
+    const handlePointerMove = (e: PointerEvent) => {
+      if (e.buttons !== 0) return;
+      const inside = isInsideBounds(e.clientX, e.clientY);
+      onZoneChange?.(inside ? 'glide' : 'rotate');
+      domElement.style.cursor = inside ? 'grab' : 'crosshair';
+    };
+
+    const handlePointerUp = () => {
+      if (!domElement) return;
+      domElement.style.cursor = 'default';
+    };
+
+    // Use capture phase so controlsRef.current.mouseButtons.LEFT is set before OrbitControls processes it
+    domElement.addEventListener('pointerdown', handlePointerDown, { capture: true });
+    domElement.addEventListener('pointermove', handlePointerMove, { passive: true });
+    window.addEventListener('pointerup', handlePointerUp);
+
+    return () => {
+      domElement.removeEventListener('pointerdown', handlePointerDown, { capture: true });
+      domElement.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+    };
+  }, [gl.domElement, camera, mapBounds, navMode, onZoneChange, onManualTakeover]);
+
+  // Compute flight trajectory curve for follow drone mode
+  const waypoints = useMemo(() => {
+    if (!planes || planes.length === 0) return [];
+    return planes.map((p, i) => {
+      const swayX = Math.sin((i / Math.max(planes.length, 1)) * Math.PI * 2) * 4.0;
+      const altY = 28.0 + Math.sin(i * 0.5) * 2.0;
+      return new THREE.Vector3(p.x + swayX, altY, p.y);
+    });
+  }, [planes]);
+
+  const curve = useMemo(() => {
+    if (waypoints.length < 2) return null;
+    return new THREE.CatmullRomCurve3(waypoints, false, 'catmullrom', 0.2);
+  }, [waypoints]);
+
+  // Keyboard navigation listener (WASD + Arrow keys)
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.target as HTMLElement)?.tagName === 'INPUT') return;
+      keysPressed.current[e.code] = true;
+    };
+    const handleKeyUp = (e: KeyboardEvent) => {
+      keysPressed.current[e.code] = false;
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
+  }, []);
+
+  useFrame(({ clock }, delta) => {
+    if (navMode === 'follow' && curve) {
+      const t = (clock.getElapsedTime() * 0.05) % 1;
+      const pos = curve.getPointAt(t);
+      const tangent = curve.getTangentAt(t).normalize();
+      const behindCam = pos.clone().sub(tangent.clone().multiplyScalar(26)).add(new THREE.Vector3(0, 15, 0));
+      camera.position.lerp(behindCam, 0.08);
+      camera.lookAt(pos.clone().add(tangent.clone().multiplyScalar(15)));
+      return;
+    }
+
+    // Keyboard smooth gliding across map (W/S moves along flight path, A/D strafes)
+    const moveSpeed = 65 * delta;
+    const forward = new THREE.Vector3();
+    camera.getWorldDirection(forward);
+    forward.y = 0;
+    forward.normalize();
+
+    const right = new THREE.Vector3();
+    right.crossVectors(camera.up, forward).negate().normalize();
+
+    const moveDelta = new THREE.Vector3();
+    if (keysPressed.current['KeyW'] || keysPressed.current['ArrowUp']) {
+      moveDelta.add(forward.clone().multiplyScalar(moveSpeed));
+    }
+    if (keysPressed.current['KeyS'] || keysPressed.current['ArrowDown']) {
+      moveDelta.add(forward.clone().multiplyScalar(-moveSpeed));
+    }
+    if (keysPressed.current['KeyD'] || keysPressed.current['ArrowRight']) {
+      moveDelta.add(right.clone().multiplyScalar(moveSpeed));
+    }
+    if (keysPressed.current['KeyA'] || keysPressed.current['ArrowLeft']) {
+      moveDelta.add(right.clone().multiplyScalar(-moveSpeed));
+    }
+
+    if (moveDelta.lengthSq() > 0) {
+      camera.position.add(moveDelta);
+      if (controlsRef.current && controlsRef.current.target) {
+        controlsRef.current.target.add(moveDelta);
+      }
+    }
+  });
+
+  if (navMode === 'follow') return null;
+
+  return (
+    <OrbitControls
+      ref={controlsRef}
+      target={[0, 8, 55]}
+      enableDamping
+      dampingFactor={0.08}
+      panSpeed={1.4}
+      rotateSpeed={1.0}
+      minDistance={5}
+      maxDistance={750}
+      screenSpacePanning={false}
+      maxPolarAngle={Math.PI / 2 - 0.02}
+      makeDefault
+    />
+  );
+};
+
+const PointCloudViewer: React.FC<PointCloudViewerProps> = ({
+  cloud,
+  viewMode,
+  clipHeight,
+  pointSize,
+  showTrajectory = true,
+  navMode,
+  mapBounds,
+  resetKey,
+  onZoneChange,
+  onManualTakeover,
+}) => (
   <Canvas
     style={{ width: '100%', height: '100%', background: '#060b14' }}
     gl={{ antialias: true, alpha: true }}
   >
-    <PerspectiveCamera makeDefault position={[0, 95, 125]} fov={50} />
+    <PerspectiveCamera makeDefault position={[0, 52, -38]} fov={50} />
     <ambientLight intensity={1.2} />
     <directionalLight position={[70, 130, 70]} intensity={1.5} castShadow />
     <directionalLight position={[-60, 90, -60]} intensity={0.5} />
@@ -557,15 +877,22 @@ const PointCloudViewer: React.FC<PointCloudViewerProps> = ({ cloud, viewMode, cl
     <Suspense fallback={null}>
       <ReconstructedMesh cloud={cloud} viewMode={viewMode} clipHeight={clipHeight} pointSize={pointSize} showTrajectory={showTrajectory} />
     </Suspense>
-    <OrbitControls
-      enableDamping
-      dampingFactor={0.08}
-      minDistance={10}
-      maxDistance={500}
-      makeDefault
+
+    {/* Visually Defined Map Boundaries with glowing perimeter, walls & beacon posts */}
+    <MapBoundaryVisual bounds={mapBounds} />
+
+    {/* Dynamic Camera Navigation: Inside boundary -> Glide; Outside boundary -> Rotate 360° */}
+    <CameraNavigationManager
+      navMode={navMode}
+      planes={cloud.planes}
+      mapBounds={mapBounds}
+      resetKey={resetKey}
+      onZoneChange={onZoneChange}
+      onManualTakeover={onManualTakeover}
     />
-    {/* Grid floor scaled to match scene — planes span 96 wide x 85 deep */}
-    <gridHelper args={[200, 40, '#0f2040', '#0d1a2e']} position={[0, -0.4, 0]} />
+
+    {/* Background Grid floor outside the survey map */}
+    <gridHelper args={[340, 68, '#0f2040', '#0d1a2e']} position={[0, -0.4, 105]} />
   </Canvas>
 );
 
@@ -618,6 +945,9 @@ const Tier2View: React.FC<Tier2ViewProps> = ({ viewMode, clipHeight, pointSize, 
   const [cloud, setCloud] = useState<PointCloud | null>(null);
   const [epoch, setEpoch] = useState(0);
   const [showSplat, setShowSplat] = useState(false);
+  const [navMode, setNavMode] = useState<'auto' | 'follow'>('auto');
+  const [activeZone, setActiveZone] = useState<'glide' | 'rotate'>('glide');
+  const [resetKey, setResetKey] = useState(0);
 
   useEffect(() => {
     // Load epoch from training_status.json
@@ -633,6 +963,42 @@ const Tier2View: React.FC<Tier2ViewProps> = ({ viewMode, clipHeight, pointSize, 
       .catch(() => { });
   }, []);
 
+  // Compute precise map boundaries from drone survey planes
+  const mapBounds = useMemo<MapBounds>(() => {
+    if (!cloud?.planes || cloud.planes.length === 0) {
+      return { minX: -50, maxX: 50, minZ: -30, maxZ: 235, width: 100, depth: 265, centerX: 0, centerZ: 102.5 };
+    }
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minZ = Infinity;
+    let maxZ = -Infinity;
+
+    cloud.planes.forEach(p => {
+      const halfW = p.w / 2;
+      const halfH = p.h / 2;
+      minX = Math.min(minX, p.x - halfW);
+      maxX = Math.max(maxX, p.x + halfW);
+      minZ = Math.min(minZ, p.y - halfH);
+      maxZ = Math.max(maxZ, p.y + halfH);
+    });
+
+    minX -= 1.5;
+    maxX += 1.5;
+    minZ -= 1.5;
+    maxZ += 1.5;
+
+    return {
+      minX,
+      maxX,
+      minZ,
+      maxZ,
+      width: maxX - minX,
+      depth: maxZ - minZ,
+      centerX: (minX + maxX) / 2,
+      centerZ: (minZ + maxZ) / 2,
+    };
+  }, [cloud?.planes]);
+
   if (!cloud) return <PointCloudPlaceholder epoch={epoch} />;
 
   return (
@@ -642,19 +1008,30 @@ const Tier2View: React.FC<Tier2ViewProps> = ({ viewMode, clipHeight, pointSize, 
           <PerspectiveCamera makeDefault position={[0, 80, 110]} fov={55} />
           <ambientLight intensity={0.8} />
           <Suspense fallback={null}>
-            {/* The splat file exported by Nerfstudio */}
             <Splat src="/api/assets/reconstruction.splat" />
           </Suspense>
           <OrbitControls makeDefault />
         </Canvas>
       ) : (
-        <PointCloudViewer cloud={cloud} viewMode={viewMode} clipHeight={clipHeight} pointSize={pointSize} showTrajectory={showTrajectory} />
+        <PointCloudViewer
+          cloud={cloud}
+          viewMode={viewMode}
+          clipHeight={clipHeight}
+          pointSize={pointSize}
+          showTrajectory={showTrajectory}
+          navMode={navMode}
+          mapBounds={mapBounds}
+          resetKey={resetKey}
+          onZoneChange={setActiveZone}
+          onManualTakeover={() => setNavMode('auto')}
+        />
       )}
 
-      {/* View Toggle */}
+      {/* View Toggle (Semantic vs 3DGS) */}
       <div style={{
         position: 'absolute', top: 50, left: 10, zIndex: 10,
-        display: 'flex', gap: 4, background: 'rgba(15,23,42,0.8)',
+        display: 'flex', gap: 4, background: 'rgba(15,23,42,0.85)',
+        backdropFilter: 'blur(8px)',
         padding: 4, borderRadius: 6, border: '1px solid rgba(56,189,248,0.2)'
       }}>
         <button
@@ -683,18 +1060,83 @@ const Tier2View: React.FC<Tier2ViewProps> = ({ viewMode, clipHeight, pointSize, 
         </button>
       </div>
 
+      {/* Top-Right Boundary Navigation Bar */}
+      <div style={{
+        position: 'absolute', top: 50, right: 14, zIndex: 10,
+        display: 'flex', alignItems: 'center', gap: 6, background: 'rgba(15,23,42,0.92)',
+        backdropFilter: 'blur(12px)',
+        padding: '5px 8px', borderRadius: 9, border: '1px solid rgba(56,189,248,0.25)',
+        boxShadow: '0 6px 24px rgba(0,0,0,0.55)',
+      }}>
+        {/* Dynamic Boundary Zone Status Badge */}
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 6,
+          padding: '4px 11px', fontSize: 11, fontWeight: 700,
+          background: activeZone === 'glide' ? 'rgba(2,132,199,0.2)' : 'rgba(168,85,247,0.2)',
+          color: activeZone === 'glide' ? '#38bdf8' : '#c084fc',
+          border: activeZone === 'glide' ? '1px solid rgba(56,189,248,0.45)' : '1px solid rgba(192,132,252,0.45)',
+          borderRadius: 6,
+          transition: 'all 0.2s ease',
+          fontFamily: "'JetBrains Mono', monospace",
+        }}>
+          <span style={{
+            width: 7, height: 7, borderRadius: '50%',
+            background: activeZone === 'glide' ? '#38bdf8' : '#c084fc',
+            boxShadow: activeZone === 'glide' ? '0 0 8px #38bdf8' : '0 0 8px #c084fc',
+          }} />
+          {activeZone === 'glide' ? 'INSIDE MAP · DRAG TO GLIDE' : 'OUTSIDE BOUNDARY · DRAG TO ROTATE 360°'}
+        </div>
+
+        {/* Follow Drone Button */}
+        <button
+          onClick={() => setNavMode(m => m === 'follow' ? 'auto' : 'follow')}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 5,
+            padding: '5px 12px', fontSize: 11, fontWeight: 600,
+            background: navMode === 'follow' ? '#0ea5e9' : 'transparent',
+            color: navMode === 'follow' ? '#ffffff' : '#94a3b8',
+            border: 'none', borderRadius: 6, cursor: 'pointer',
+            transition: 'all 0.2s',
+          }}
+          title="Camera dynamically follows the animated UAV drone"
+        >
+          <Video size={13} />
+          {navMode === 'follow' ? 'Following Drone' : 'Follow Drone'}
+        </button>
+
+        {/* Reset Camera View */}
+        <button
+          onClick={() => {
+            setNavMode('auto');
+            setResetKey(k => k + 1);
+          }}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 5,
+            padding: '5px 10px', fontSize: 11, fontWeight: 600,
+            background: 'transparent',
+            color: '#64748b',
+            border: 'none', borderRadius: 6, cursor: 'pointer',
+            transition: 'all 0.2s',
+          }}
+          title="Reset camera view to beginning of flight corridor"
+        >
+          <RotateCcw size={13} />
+          Reset
+        </button>
+      </div>
+
       {/* Info overlay */}
       <div style={{
         position: 'absolute', top: 10, left: '50%', transform: 'translateX(-50%)',
         display: 'flex', gap: 8, pointerEvents: 'none', flexWrap: 'wrap', justifyContent: 'center',
       }}>
         {[
-          { label: 'EPOCH', value: String(cloud.stats?.epochAtExport ?? cloud.epochAtExport ?? '–') },
-          { label: 'mAP50', value: `${((cloud.stats?.mAP50AtExport ?? cloud.mAP50AtExport ?? 0) * 100).toFixed(1)}%` },
+          { label: 'EPOCH', value: String(cloud.stats?.epochAtExport ?? (cloud as any).epochAtExport ?? '–') },
+          { label: 'mAP50', value: `${(((cloud.stats?.mAP50AtExport ?? (cloud as any).mAP50AtExport ?? 0)) * 100).toFixed(1)}%` },
           { label: 'TERRAIN', value: (cloud.stats?.numTerrain ?? cloud.terrain?.length ?? 0).toLocaleString() },
           { label: 'OBJECTS', value: (cloud.stats?.numObjects ?? cloud.objects?.length ?? 0).toLocaleString() },
           { label: 'DEPTH', value: (cloud.depthBackend ?? 'n/a').toUpperCase() },
-          { label: 'MODEL', value: (cloud.stats?.modelName ?? cloud.modelName ?? 'YOLO').toUpperCase() },
+          { label: 'MODEL', value: (cloud.stats?.modelName ?? (cloud as any).modelName ?? 'YOLO').toUpperCase() },
         ].map(({ label, value }) => (
           <div key={label} style={{
             background: 'rgba(6,11,20,0.82)', backdropFilter: 'blur(8px)',
@@ -711,10 +1153,15 @@ const Tier2View: React.FC<Tier2ViewProps> = ({ viewMode, clipHeight, pointSize, 
       {/* Controls hint */}
       <div style={{
         position: 'absolute', bottom: 12, left: '50%', transform: 'translateX(-50%)',
-        fontFamily: "'JetBrains Mono', monospace", fontSize: 9, color: '#334155',
-        pointerEvents: 'none',
+        fontFamily: "'JetBrains Mono', monospace", fontSize: 10,
+        color: '#94a3b8', background: 'rgba(6,11,20,0.88)', backdropFilter: 'blur(10px)',
+        padding: '5px 18px', borderRadius: 14, border: '1px solid rgba(56,189,248,0.22)',
+        pointerEvents: 'none', boxShadow: '0 4px 18px rgba(0,0,0,0.45)',
+        whiteSpace: 'nowrap',
       }}>
-        drag to rotate · scroll to zoom · right-drag to pan
+        {navMode === 'follow'
+          ? '🛸 Following Drone along Flight Corridor · Click anywhere to take manual control'
+          : '🖐️ Inside Map Boundary: Left-drag to glide forward & across map · 🔄 Outside Boundary: Left-drag to rotate 360° · Scroll to zoom'}
       </div>
 
       {/* Scan line */}

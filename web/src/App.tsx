@@ -13,7 +13,7 @@ type TierMode = 'tier1' | 'tier2';
 type RightTab = 'pipeline' | 'metrics';
 
 // ─── Tooltip ───────────────────────────────────────────────────
-const Tooltip: React.FC<{ text: string; children: React.ReactNode }> = ({
+export const Tooltip: React.FC<{ text: string; children: React.ReactNode }> = ({
   text, children,
 }) => (
   <div className="tooltip-wrap">

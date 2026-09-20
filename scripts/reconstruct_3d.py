@@ -415,8 +415,28 @@ def extract_building_instances(
         cy_px = float(centroids[i][1])
         cx_w  = (cx_px - w / 2.0) * phys_scale
         cz_w  = (cy_px - h / 2.0) * phys_scale + offset_y
-        width_w = max(6.0, box_w * phys_scale)
-        depth_w = max(6.0, box_h * phys_scale)
+        # Determine actual building roof footprint from local boundary
+        w_raw = box_w * phys_scale
+        d_raw = box_h * phys_scale
+
+        r = 160
+        x0_w, y0_w = max(0, int(cx_px - r)), max(0, int(cy_px - r))
+        x1_w, y1_w = min(w, int(cx_px + r)), min(h, int(cy_px + r))
+        crop_local = img_bgr[y0_w:y1_w, x0_w:x1_w]
+
+        ff_mask = np.zeros((crop_local.shape[0] + 2, crop_local.shape[1] + 2), np.uint8)
+        s_x = min(crop_local.shape[1] - 1, max(0, int(cx_px - x0_w)))
+        s_y = min(crop_local.shape[0] - 1, max(0, int(cy_px - y0_w)))
+        cv2.floodFill(crop_local.copy(), ff_mask, (s_x, s_y), (255, 255, 255), (22, 22, 22), (22, 22, 22), cv2.FLOODFILL_MASK_ONLY)
+        filled = ff_mask[1:-1, 1:-1]
+        ys_f, xs_f = np.where(filled > 0)
+
+        if len(xs_f) > 80:
+            width_w = max(w_raw, min(22.0, (xs_f.max() - xs_f.min()) * phys_scale))
+            depth_w = max(d_raw, min(18.0, (ys_f.max() - ys_f.min()) * phys_scale))
+        else:
+            width_w = max(w_raw, 11.0)
+            depth_w = max(d_raw, 9.5)
 
         pad = 8
         crop = img_bgr[
